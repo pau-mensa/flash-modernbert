@@ -174,9 +174,14 @@ def measure(call, ids, mask, *, n_warmup: int, n_iters: int, n_trials: int) -> d
     }
 
 
-def variant_calls(model_obj, encoder, graph_config: GraphConfig, validate: bool):
-    """Yield (name, call) for stock, fused, graphed — built lazily so each is
-    measured in its own state. The stock forward is captured before prepare()."""
+def variant_calls(model_obj, encoder, graph_config: GraphConfig, validate: bool, backends):
+    """Yield (name, call): `stock` once, then `fused[<b>]` and `graphed[<b>]` for
+    each attention backend `b`. The stock forward is captured before prepare();
+    backends are toggled on the same prepared model, rebuilding the graph runner
+    per backend so each captures its own attention path. Built lazily — the
+    consumer measures between yields, so state mutations land in order."""
+    from flash_modernbert.state import get_state
+
     stock_forward = encoder.forward  # bound HF forward, before any patch
 
     @torch.no_grad()
@@ -185,21 +190,24 @@ def variant_calls(model_obj, encoder, graph_config: GraphConfig, validate: bool)
 
     yield "stock", stock
 
-    fm.prepare(model_obj, validate=validate)  # patches encoder.forward (eager)
+    fm.prepare(model_obj, validate=validate)  # patches encoder.forward (eager, sdpa)
+    state = get_state(model_obj)
 
     @torch.no_grad()
-    def fused(ids, mask):
+    def patched(ids, mask):  # reads state.attention_backend / graph at call time
         return _last_hidden(encoder.forward(input_ids=ids, attention_mask=mask))
 
-    yield "fused", fused
+    for b in backends:
+        state.attention_backend = b
+        fm.set_cuda_graph(model_obj, False)  # eager fused for this backend
+        state.graph_runner = None
+        yield f"fused[{b}]", patched
 
-    fm.set_cuda_graph(model_obj, True, config=graph_config)
+        fm.set_cuda_graph(model_obj, True, config=graph_config)  # fresh capture under b
+        yield f"graphed[{b}]", patched
 
-    @torch.no_grad()
-    def graphed(ids, mask):
-        return _last_hidden(encoder.forward(input_ids=ids, attention_mask=mask))
-
-    yield "graphed", graphed
+    fm.set_cuda_graph(model_obj, False)
+    state.graph_runner = None
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +230,7 @@ def run(cfg: Config, device: torch.device) -> dict:
         n_trials=int(run_cfg.get("n_trials", 5)),
     )
     validate = bool(run_cfg.get("validate", True))
+    backends = cfg.raw.get("attention_backends", ["sdpa"])
 
     # Pre-tokenized batches, one per shape, reused across variants.
     batches = {
@@ -231,7 +240,7 @@ def run(cfg: Config, device: torch.device) -> dict:
 
     # variant -> shape_index -> result
     results: dict[str, dict[int, dict]] = {}
-    for name, call in variant_calls(model_obj, encoder, graph_cfg, validate):
+    for name, call in variant_calls(model_obj, encoder, graph_cfg, validate, backends):
         results[name] = {}
         for i, sh in enumerate(shapes):
             ids, mask = batches[i]
@@ -239,7 +248,7 @@ def run(cfg: Config, device: torch.device) -> dict:
             r["samples_per_s"] = sh["b"] * 1e3 / r["ms"]
             results[name][i] = r
             print(
-                f"  {name:<8s} {sh['kind']:<8s} B={sh['b']:<4d} S={sh['s']:<5d} "
+                f"  {name:<15s} {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d} "
                 f"{r['ms']:7.3f} ms  {r['samples_per_s']:9.0f} samp/s  "
                 f"{r['peak_mb']:7.0f} MB"
             )
@@ -253,24 +262,21 @@ def run(cfg: Config, device: torch.device) -> dict:
 
 
 def _assemble(cfg: Config, shapes: list[dict], results: dict) -> dict:
+    variants = list(results.keys())  # "stock" first, then fused[..]/graphed[..]
     rows = []
     for i, sh in enumerate(shapes):
         stock = results["stock"][i]
-        fused = results["fused"][i]
-        graphed = results["graphed"][i]
-        rows.append({
-            "shape": sh,
-            "stock": stock,
-            "fused": fused,
-            "graphed": graphed,
-            "fused_speedup": stock["ms"] / fused["ms"],
-            "graphed_speedup": stock["ms"] / graphed["ms"],
-            "graphed_vs_fused": fused["ms"] / graphed["ms"],
-        })
+        per_variant = {}
+        for v in variants:
+            r = dict(results[v][i])
+            r["speedup"] = stock["ms"] / r["ms"]  # vs stock HF
+            per_variant[v] = r
+        rows.append({"shape": sh, "variants": per_variant})
     return {
         "config": cfg.raw,
         "device": torch.cuda.get_device_name(0),
         "capability": list(torch.cuda.get_device_capability(0)),
+        "variants": variants,
         "rows": rows,
     }
 
@@ -321,37 +327,41 @@ def write_outputs(cfg: Config, payload: dict, config_path: str):
     return json_path, png_path
 
 
+_PALETTE = ["#3b6ea5", "#e8a33d", "#d1495b", "#5a9e6f", "#9b59b6", "#444444"]
+
+
 def _plot(payload: dict, png_path: Path, name: str):
     rows = payload["rows"]
+    variants = payload["variants"]
     labels = [f"{r['shape']['kind']}\nB{r['shape']['b']} S{r['shape']['s']}" for r in rows]
     x = range(len(rows))
-    width = 0.27
-    colors = {"stock": "#3b6ea5", "fused": "#e8a33d", "graphed": "#d1495b"}
+    colors = {v: _PALETTE[i % len(_PALETTE)] for i, v in enumerate(variants)}
+    n = len(variants)
+    width = 0.8 / n
 
-    fig, (ax_ms, ax_sp) = plt.subplots(1, 2, figsize=(max(11, 2.2 * len(rows)), 5))
+    fig, (ax_ms, ax_sp) = plt.subplots(1, 2, figsize=(max(12, 2.6 * len(rows)), 5))
 
-    for off, variant in zip((-width, 0, width), ("stock", "fused", "graphed")):
-        ms = [r[variant]["ms"] for r in rows]
-        ax_ms.bar([i + off for i in x], ms, width, label=variant, color=colors[variant])
+    for vi, v in enumerate(variants):
+        off = (vi - (n - 1) / 2) * width
+        ms = [r["variants"][v]["ms"] for r in rows]
+        ax_ms.bar([i + off for i in x], ms, width, label=v, color=colors[v])
     ax_ms.set(ylabel="ms / call (lower is better)", title="Encoder forward latency")
-    ax_ms.set_xticks(list(x))
-    ax_ms.set_xticklabels(labels, fontsize=8)
-    ax_ms.legend()
-    ax_ms.grid(True, axis="y", alpha=0.3)
+    ax_ms.set_xticks(list(x)); ax_ms.set_xticklabels(labels, fontsize=8)
+    ax_ms.legend(fontsize=8); ax_ms.grid(True, axis="y", alpha=0.3)
 
-    fused_sp = [r["fused_speedup"] for r in rows]
-    graph_sp = [r["graphed_speedup"] for r in rows]
-    ax_sp.bar([i - width / 2 for i in x], fused_sp, width, label="fused", color=colors["fused"])
-    ax_sp.bar([i + width / 2 for i in x], graph_sp, width, label="graphed", color=colors["graphed"])
+    speedup_variants = [v for v in variants if v != "stock"]
+    m = len(speedup_variants)
+    sw = 0.8 / max(m, 1)
+    for vi, v in enumerate(speedup_variants):
+        off = (vi - (m - 1) / 2) * sw
+        sp = [r["variants"][v]["speedup"] for r in rows]
+        ax_sp.bar([i + off for i in x], sp, sw, label=v, color=colors[v])
+        for i, s in enumerate(sp):
+            ax_sp.text(i + off, s, f"{s:.1f}", ha="center", va="bottom", fontsize=6, rotation=90)
     ax_sp.axhline(1.0, color="#444", lw=1, ls="--")
-    for i, (f, g) in enumerate(zip(fused_sp, graph_sp)):
-        ax_sp.text(i - width / 2, f, f"{f:.2f}x", ha="center", va="bottom", fontsize=7)
-        ax_sp.text(i + width / 2, g, f"{g:.2f}x", ha="center", va="bottom", fontsize=7)
     ax_sp.set(ylabel="speedup vs stock HF", title="Speedup vs stock")
-    ax_sp.set_xticks(list(x))
-    ax_sp.set_xticklabels(labels, fontsize=8)
-    ax_sp.legend()
-    ax_sp.grid(True, axis="y", alpha=0.3)
+    ax_sp.set_xticks(list(x)); ax_sp.set_xticklabels(labels, fontsize=8)
+    ax_sp.legend(fontsize=8); ax_sp.grid(True, axis="y", alpha=0.3)
 
     fig.suptitle(
         f"{name} — encoder forward inference ({payload['device']}, "
@@ -385,12 +395,14 @@ def main():
     payload = run(cfg, device)
     json_path, png_path = write_outputs(cfg, payload, args.config)
 
-    print("=== fused / graphed vs stock HF ===")
+    speedup_variants = [v for v in payload["variants"] if v != "stock"]
+    print("=== speedup vs stock HF (ms/call; peak MB) ===")
     for r in payload["rows"]:
         sh = r["shape"]
-        print(f"  {sh['kind']:<8s} B={sh['b']:<4d} S={sh['s']:<5d}  "
-              f"fused {r['fused_speedup']:.2f}x  graphed {r['graphed_speedup']:.2f}x "
-              f"(graphed/fused {r['graphed_vs_fused']:.2f}x)")
+        parts = " ".join(
+            f"{v} {r['variants'][v]['speedup']:.2f}x" for v in speedup_variants
+        )
+        print(f"  {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d}  {parts}")
     print(f"\nwrote {json_path}\nwrote {png_path}")
 
 

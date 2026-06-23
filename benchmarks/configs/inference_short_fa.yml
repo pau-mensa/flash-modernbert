@@ -1,0 +1,12 @@
+# Short-S backend comparison (queries Q≈32, docs D≈300). FA windowing can't help
+# when window >= S, so this checks the flash path doesn't *regress* short-S.
+run: { validate: true, n_warmup: 15, n_iters: 50, n_trials: 7 }
+model: { name_or_path: answerdotai/ModernBERT-base, framework: huggingface, dtype: bfloat16 }
+attention_backends: [sdpa, flash]
+graph: { pad_to: 32, max_graphs: 32 }
+shapes:
+  - { b: 32,  s: 32,  kind: query }
+  - { b: 256, s: 32,  kind: query }
+  - { b: 32,  s: 320, kind: doc }
+  - { b: 16,  s: 512, kind: doc }
+output: { dir: benchmarks/results, name: inference_short_fa }

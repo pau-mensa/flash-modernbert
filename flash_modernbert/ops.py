@@ -236,3 +236,53 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
     out = out.transpose(1, 2)
     b, s = out.shape[:2]
     return out.reshape(b, s, -1)
+
+
+_flash_attn_func = None
+
+
+def _load_flash_attn():
+    """Import flash_attn lazily so the dependency is only required when the flash
+    backend is actually selected (the default sdpa path stays dependency-free)."""
+    global _flash_attn_func
+    if _flash_attn_func is None:
+        try:
+            from flash_attn import flash_attn_func
+        except ImportError as exc:  # pragma: no cover - import-time guard
+            raise ImportError(
+                "attention_backend='flash' needs the flash-attn package "
+                "(pip install flash-attn). The default 'sdpa' backend needs nothing."
+            ) from exc
+        _flash_attn_func = flash_attn_func
+    return _flash_attn_func
+
+
+def flash_attention(q, k, v, window, scaling):
+    """FlashAttention with the layer's *structure* (window) instead of a dense
+    mask: `window=(-1, -1)` is full attention (global layers), `window=(w, w)` is
+    a symmetric sliding band `|i - j| <= w` (local layers), which FA prunes to the
+    band rather than computing the full `S×S` — the long-S win.
+
+    q/k/v arrive as the [B, H, S, D] transpose views the rest of the tail uses;
+    FA wants [B, S, H, D], so we transpose back (contiguous, since FA needs packed
+    qkv). Assumes an unpadded batch — padding would need `flash_attn_varlen_func`
+    with cu_seqlens; the dense-mask sdpa backend remains the path for that.
+    """
+    flash_attn_func = _load_flash_attn()
+    qf = q.transpose(1, 2).contiguous()
+    kf = k.transpose(1, 2).contiguous()
+    vf = v.transpose(1, 2).contiguous()
+    out = flash_attn_func(
+        qf, kf, vf, dropout_p=0.0, softmax_scale=scaling,
+        causal=False, window_size=window,
+    )
+    b, s = out.shape[:2]
+    return out.reshape(b, s, -1)
+
+
+def attention(q, k, v, *, mask, window, scaling, backend):
+    """Dispatch attention to the selected backend. `mask` feeds sdpa; `window`
+    feeds flash. Both are precomputed per layer so this stays a thin switch."""
+    if backend == "flash":
+        return flash_attention(q, k, v, window, scaling)
+    return sdpa_attention(q, k, v, mask, scaling)

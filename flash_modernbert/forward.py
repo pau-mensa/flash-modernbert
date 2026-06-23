@@ -177,6 +177,8 @@ def _encoder_layer(
     cos: Tensor,
     sin: Tensor,
     mask: Tensor | None,
+    window: tuple[int, int],
+    backend: str,
 ) -> Tensor:
     b, s = x.shape[:2]
     h, d = params.num_attention_heads, params.head_dim
@@ -191,7 +193,7 @@ def _encoder_layer(
     q, k, v = qkv.unbind(dim=2)
     q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     q, k = ops.fused_apply_rope(q, k, cos, sin)
-    ctx = ops.sdpa_attention(q, k, v, mask, params.scaling)
+    ctx = ops.attention(q, k, v, mask=mask, window=window, scaling=params.scaling, backend=backend)
     x = x + F.linear(ctx, layer.attn.Wo.weight, None)
 
     mlp_norm = layer.mlp_norm
@@ -211,14 +213,23 @@ def core(
     sin_local: Tensor,
     full_mask: Tensor | None,
     sliding_mask: Tensor,
+    *,
+    backend: str = "sdpa",
 ) -> Tensor:
-    """Encoder-layer loop + final norm. The capturable region."""
+    """Encoder-layer loop + final norm. The capturable region.
+
+    Each layer gets both the dense mask (for the sdpa backend) and its attention
+    *window* (for the flash backend): global layers attend fully `(-1, -1)`, local
+    layers over the sliding band `(±sliding_half_window)`."""
+    half = params.sliding_half_window
+    global_window = (-1, -1)
+    local_window = (half, half)
     for layer_idx, layer in enumerate(model.layers):
         if _layer_is_global(layer, layer_idx, params):
-            cos, sin, mask = cos_global, sin_global, full_mask
+            cos, sin, mask, window = cos_global, sin_global, full_mask, global_window
         else:
-            cos, sin, mask = cos_local, sin_local, sliding_mask
-        x = _encoder_layer(x, layer, params, cos, sin, mask)
+            cos, sin, mask, window = cos_local, sin_local, sliding_mask, local_window
+        x = _encoder_layer(x, layer, params, cos, sin, mask, window, backend)
     final_norm = model.final_norm
     return ops.fused_layer_norm(x, final_norm.weight, final_norm.eps)
 
@@ -228,6 +239,8 @@ def fused_forward(
     params: ModernBertParams,
     input_ids: Tensor,
     attention_mask: Tensor | None,
+    *,
+    backend: str = "sdpa",
 ) -> Tensor:
     """Eager fused-tail forward — returns the final-normed hidden state."""
     p = prologue(model, params, input_ids, attention_mask)
@@ -235,4 +248,5 @@ def fused_forward(
         model, params,
         p.x, p.cos_global, p.sin_global, p.cos_local, p.sin_local,
         p.full_mask, p.sliding_mask,
+        backend=backend,
     )

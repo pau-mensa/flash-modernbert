@@ -132,10 +132,17 @@ class _StaticInputs:
 class _GraphRunner:
     """Holds one captured graph per `(batch, seq_bucket)` and replays it."""
 
-    def __init__(self, model: nn.Module, params: ModernBertParams, config: GraphConfig):
+    def __init__(
+        self,
+        model: nn.Module,
+        params: ModernBertParams,
+        config: GraphConfig,
+        backend: str = "sdpa",
+    ):
         self._model = model
         self._params = params
         self._config = config
+        self._backend = backend
         self._cache: "OrderedDict[tuple[int, int], _Captured]" = OrderedDict()
         param = next(model.parameters())
         self._device = param.device
@@ -164,7 +171,9 @@ class _GraphRunner:
         return captured.out[:b, :s].clone()
 
     def _eager(self, input_ids: Tensor, attention_mask: Tensor | None) -> Tensor:
-        return forward.fused_forward(self._model, self._params, input_ids, attention_mask)
+        return forward.fused_forward(
+            self._model, self._params, input_ids, attention_mask, backend=self._backend
+        )
 
     def _insert(self, key: tuple[int, int], captured: "_Captured") -> None:
         """Insert a freshly captured graph, evicting the least-recently-replayed
@@ -204,6 +213,7 @@ class _GraphRunner:
             self._model, self._params,
             p.x, p.cos_global, p.sin_global, p.cos_local, p.sin_local,
             p.full_mask, p.sliding_mask,
+            backend=self._backend,
         )
 
     def precapture(self, batch: int, seq_buckets) -> None:
@@ -214,8 +224,13 @@ class _GraphRunner:
                 self._insert(key, self._capture(batch, sb))
 
 
-def build_runner(model: nn.Module, params: ModernBertParams, config: GraphConfig) -> _GraphRunner:
-    runner = _GraphRunner(model, params, config)
+def build_runner(
+    model: nn.Module,
+    params: ModernBertParams,
+    config: GraphConfig,
+    backend: str = "sdpa",
+) -> _GraphRunner:
+    runner = _GraphRunner(model, params, config, backend=backend)
     if config.seq_buckets:
         if config.max_batch is None:
             warnings.warn(
@@ -240,7 +255,8 @@ def set_cuda_graph(model: object, enabled: bool, *, config: GraphConfig | None =
     state = get_state(model)
     if enabled and state.graph_runner is None:
         state.graph_runner = build_runner(
-            encoder_of(model), state.params, config or GraphConfig()
+            encoder_of(model), state.params, config or GraphConfig(),
+            backend=state.attention_backend,
         )
     state.graph_enabled = enabled
 

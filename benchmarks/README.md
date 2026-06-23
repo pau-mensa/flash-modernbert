@@ -189,8 +189,45 @@ Three honest takeaways:
   for query expansion / fixed-length unpadded indexing, wrong for padded batches).
 
 **Guidance:** enable `cuda_graph` for short-S query serving (it is what makes the
-fused tail competitive there) and whenever peak memory is the constraint; for
-long-S document indexing where latency is king, the eager fused tail is fastest.
+fused tail competitive there) and whenever peak memory is the constraint. For
+long-S document indexing, the `flash` attention backend below is the bigger lever.
+
+### attention_backend="flash" — windowed FlashAttention for long S
+
+The sdpa speedup *shrinks* as S grows because the sliding-window local layers
+(≈2/3 of the model) are expressed as a dense `S×S` mask and run full O(S²).
+`prepare(model, attention_backend="flash")` swaps attention for FlashAttention,
+which takes the window as *structure* (`window_size`) and prunes the local layers
+to the band — O(S·W) — instead of masking. It needs the `flash-attn` package and
+targets unpadded inference (queries with expansion, fixed-length docs); the
+default `"sdpa"` backend is dependency-free and handles padded batches.
+
+Backend comparison (5090, ModernBERT-base, bf16), speedup vs stock HF, run via
+`inference_indexing_fa.yml` / `inference_short_fa.yml`:
+
+| shape | graphed[sdpa] | graphed[flash] | graphed[flash] peak |
+| --- | --- | --- | --- |
+| query B32 S32 | **1.60×** | 1.45× | 372 MB |
+| query B256 S32 | **1.44×** | 1.31× | 404 MB |
+| doc B32 S512 | 1.51× | **1.61×** | 420 MB |
+| doc B8 S2048 | 1.27× | **1.94×** | 488 MB |
+| doc B4 S4096 | 1.12× | **2.24×** | 521 MB |
+
+The two backends are **complementary**, splitting at ≈S512:
+
+- **Short S (queries, S≤~256): use sdpa.** FlashAttention can't prune (window ≥ S
+  → full attention) and its fixed launch cost loses to dense SDPA on tiny tensors
+  — `fused[flash]` even regresses to 0.75× at B32/S32. `graphed[sdpa]` (1.60×) is
+  the best short-S path.
+- **Long S (indexing, S≥512): use flash.** Where the sdpa speedup decays with S
+  (graphed 1.51→1.12), flash *grows* (graphed 1.61→**2.24×** at S4096), because
+  the local-layer O(S²)→O(S·W) win compounds — and `graphed[flash]` stays the
+  memory-cheapest path (521 MB at S4096 vs eager-fused 1017, stock 765). So at
+  long S, graphed[flash] is simultaneously fastest *and* lightest.
+
+Correctness: the flash forward matches stock HF at cosine 0.9995 (tighter than
+sdpa's 0.99918). Measured on a torch-2.8 env with the prebuilt FA 2.8.3 wheel
+(runs on sm_120 from PTX — no toolkit build).
 
 Configs: `inference_short.yml` (classic ColBERT Q≈32 / D≈300 — also the roadmap's
 C3 short-S config) and `inference_indexing.yml` (long documents). Both take a

@@ -29,6 +29,7 @@ def prepare(
     target: object,
     *,
     cuda_graph: bool | GraphConfig = False,
+    attention_backend: str = "sdpa",
     validate: bool = True,
 ) -> object:
     """Install the fused-tail forward onto `target` and return the same object.
@@ -38,8 +39,15 @@ def prepare(
     located and patched in place.
 
     `cuda_graph` enables the bucketed CUDA-graph runner (off by default — the
-    plain eager fused forward). `validate` runs the hard gate during prepare.
+    plain eager fused forward). `attention_backend` selects the attention kernel:
+    `"sdpa"` (default, dependency-free, dense-mask) or `"flash"` (FlashAttention
+    with sliding-window pruning on local layers — needs the flash-attn package and
+    targets unpadded inference). `validate` runs the hard gate during prepare.
     """
+    if attention_backend not in ("sdpa", "flash"):
+        raise FlashModernBertError(
+            f"attention_backend must be 'sdpa' or 'flash', got {attention_backend!r}"
+        )
     encoder = find_encoder(target)
 
     existing = getattr(encoder, ATTR, None)
@@ -54,7 +62,10 @@ def prepare(
         _require_cuda(encoder)
 
     params = ModernBertParams.from_hf_config(encoder.config)
-    state = PatchState(params=params, original_forward=encoder.forward)
+    state = PatchState(
+        params=params, original_forward=encoder.forward,
+        attention_backend=attention_backend,
+    )
     if cuda_graph:
         _enable_graphs(encoder, state, cuda_graph)
 
@@ -65,7 +76,9 @@ def prepare(
 
 def _enable_graphs(encoder: nn.Module, state: PatchState, cuda_graph: bool | GraphConfig) -> None:
     config = cuda_graph if isinstance(cuda_graph, GraphConfig) else GraphConfig()
-    state.graph_runner = build_runner(encoder, state.params, config)
+    state.graph_runner = build_runner(
+        encoder, state.params, config, backend=state.attention_backend
+    )
     state.graph_enabled = True
 
 
@@ -122,7 +135,10 @@ def _make_forward(encoder: nn.Module, state: PatchState):
         if use_graph:
             hidden = state.graph_runner(input_ids, attention_mask)
         else:
-            hidden = fused_forward(encoder, state.params, input_ids, attention_mask)
+            hidden = fused_forward(
+                encoder, state.params, input_ids, attention_mask,
+                backend=state.attention_backend,
+            )
 
         if not return_dict:
             return (hidden,)
