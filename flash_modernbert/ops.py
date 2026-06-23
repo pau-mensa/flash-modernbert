@@ -264,17 +264,16 @@ def flash_attention(q, k, v, window, scaling):
     band rather than computing the full `S×S` — the long-S win.
 
     q/k/v arrive as the [B, H, S, D] transpose views the rest of the tail uses;
-    FA wants [B, S, H, D], so we transpose back (contiguous, since FA needs packed
-    qkv). Assumes an unpadded batch — padding would need `flash_attn_varlen_func`
-    with cu_seqlens; the dense-mask sdpa backend remains the path for that.
+    FA wants [B, S, H, D]. The `.transpose(1, 2)` back is a free view — and FA
+    only requires the head dim (last) to be contiguous, which it is (RoPE outputs
+    contiguous [B, H, S, D], and v's unbind view keeps D packed), so we pass the
+    strided views directly with no copy. Assumes an unpadded batch — padding would
+    need `flash_attn_varlen_func` with cu_seqlens; sdpa remains the path for that.
     """
     flash_attn_func = _load_flash_attn()
-    qf = q.transpose(1, 2).contiguous()
-    kf = k.transpose(1, 2).contiguous()
-    vf = v.transpose(1, 2).contiguous()
     out = flash_attn_func(
-        qf, kf, vf, dropout_p=0.0, softmax_scale=scaling,
-        causal=False, window_size=window,
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        dropout_p=0.0, softmax_scale=scaling, causal=False, window_size=window,
     )
     b, s = out.shape[:2]
     return out.reshape(b, s, -1)

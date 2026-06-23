@@ -207,23 +207,31 @@ Backend comparison (5090, ModernBERT-base, bf16), speedup vs stock HF, run via
 
 | shape | graphed[sdpa] | graphed[flash] | graphed[flash] peak |
 | --- | --- | --- | --- |
-| query B32 S32 | **1.60×** | 1.45× | 372 MB |
-| query B256 S32 | **1.44×** | 1.31× | 404 MB |
-| doc B32 S512 | 1.51× | **1.61×** | 420 MB |
-| doc B8 S2048 | 1.27× | **1.94×** | 488 MB |
-| doc B4 S4096 | 1.12× | **2.24×** | 521 MB |
+| query B32 S32 | **1.63×** | 1.52× | 372 MB |
+| query B256 S32 | **1.45×** | 1.35× | 404 MB |
+| doc B32 S320 | 1.41× | **1.45×** | 433 MB |
+| doc B32 S512 | 1.45× | **1.63×** | 420 MB |
+| doc B8 S2048 | 1.22× | **1.94×** | 488 MB |
+| doc B4 S4096 | 1.09× | **2.24×** | 521 MB |
 
-The two backends are **complementary**, splitting at ≈S512:
+The two backends are **complementary**, crossing over at ≈S320:
 
 - **Short S (queries, S≤~256): use sdpa.** FlashAttention can't prune (window ≥ S
   → full attention) and its fixed launch cost loses to dense SDPA on tiny tensors
-  — `fused[flash]` even regresses to 0.75× at B32/S32. `graphed[sdpa]` (1.60×) is
+  — `fused[flash]` even regresses to 0.77× at B32/S32. `graphed[sdpa]` (1.63×) is
   the best short-S path.
-- **Long S (indexing, S≥512): use flash.** Where the sdpa speedup decays with S
-  (graphed 1.51→1.12), flash *grows* (graphed 1.61→**2.24×** at S4096), because
+- **Long S (indexing, S≥320): use flash.** Where the sdpa speedup decays with S
+  (graphed 1.45→1.09), flash *grows* (graphed 1.63→**2.24×** at S4096), because
   the local-layer O(S²)→O(S·W) win compounds — and `graphed[flash]` stays the
   memory-cheapest path (521 MB at S4096 vs eager-fused 1017, stock 765). So at
   long S, graphed[flash] is simultaneously fastest *and* lightest.
+
+The flash path passes q/k/v as **strided `[B,S,H,D]` views** (a free `transpose`,
+no copy): FA only needs the head dim contiguous, which RoPE's contiguous
+`[B,H,S,D]` output and v's unbind view both satisfy. Materializing them with
+`.contiguous()` instead cost 3 copies/layer and dragged the short/mid-S flash
+numbers down (e.g. doc S512 graphed 1.46→1.63× once removed); at long S attention
+compute dominates so it was already negligible.
 
 Correctness: the flash forward matches stock HF at cosine 0.9995 (tighter than
 sdpa's 0.99918). Measured on a torch-2.8 env with the prebuilt FA 2.8.3 wheel
