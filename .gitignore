@@ -219,3 +219,6 @@ __marimo__/
 
 # benchmark artifacts
 benchmarks/results/
+
+# lock files
+uv.lock
