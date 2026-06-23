@@ -4,6 +4,7 @@
 #
 # [tool.uv.sources]
 # flash-modernbert = { path = "../", editable = true }
+# pylate = { git = "https://github.com/pau-mensa/pylate.git" }
 # torch = { index = "pytorch-cu128" }
 #
 # [[tool.uv.index]]
@@ -228,8 +229,10 @@ def train_variant(cfg: Config, variant: str, fused: bool, device: torch.device) 
         model.load_state_dict(_init_state[0])  # identical init to the first variant
     model = model.to(device=device, dtype=dtype)
 
+    train_graph = bool(cfg.raw.get("train_cuda_graph", False))
     if fused:
         fm.prepare(model, cuda_graph=bool(cfg.raw.get("cuda_graph", False)),
+                   train_cuda_graph=train_graph,
                    validate=bool(run.get("validate", True)))
 
     model.train()
@@ -242,8 +245,13 @@ def train_variant(cfg: Config, variant: str, fused: bool, device: torch.device) 
         else _nullcontext()
     )
 
+    # Training graphs replay a backward that writes into persistent `.grad` buffers,
+    # so those buffers must stay live across steps — zero them in place, never to
+    # None (which would free the address the captured graph writes to).
+    zero_to_none = not (fused and train_graph)
+
     def forward_backward(features) -> float:
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=zero_to_none)
         with autocast:
             loss = loss_fn(features)
         loss.backward()
@@ -262,7 +270,7 @@ def train_variant(cfg: Config, variant: str, fused: bool, device: torch.device) 
     warmup_batch = next(batches)
     for _ in range(warmup_steps):
         forward_backward(warmup_batch)
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=zero_to_none)
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
 

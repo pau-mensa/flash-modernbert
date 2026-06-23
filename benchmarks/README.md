@@ -55,11 +55,51 @@ A `dataset.format: agent_ir` flattens the AgentIR `positive_passages` /
 columns the collator wants; plain triplet datasets (`[query, positive,
 negative]`) need no `format`.
 
-**CUDA graphs are an inference feature** and are skipped during training (they
-can't be captured under autocast/autograd — autocast frees the ephemeral bf16
-weight copies a captured graph would replay against). Setting `cuda_graph: true`
-in a training config is a no-op with a one-time warning; it belongs on the
-inference benchmarks.
+**Two kinds of graph.** `cuda_graph: true` is the **inference** runner — a no-grad
+forward graph, skipped during training (it can't capture under autocast/autograd).
+`train_cuda_graph: true` is the **training** runner: it captures the encoder
+**fwd+bwd** and replays it inside autograd, so it engages on the grad-enabled
+training forward, including under bf16 autocast (it records the weight casts
+inline, reading the persistent fp32 master each replay). That is the thing for the
+short-S regime where the eager fused tail is host-launch-bound and regresses vs
+stock — see **`train_bench.py`** (the fwd+bwd A/B that measures the regression)
+and **`train_graph_short.yml`** (the GradCache A/B that measures the graph win).
+Caller invariant when training graphs are on: `optimizer.zero_grad(set_to_none=False)`
+(the backward graph writes into persistent `.grad` buffers) and exact `(B, S)`
+chunks (the bf16 backward is padding-sensitive). `iso_loss.py` handles this for
+you; the HF `SentenceTransformerTrainer` path (`pylate_trainer.py`) still defaults
+to `set_to_none=True`, so it runs eager-fused — wiring train graphs there needs
+forcing `set_to_none=False`.
+
+Measured training-graph win (5090, ModernBERT-base, bf16, GradCache, the classic
+Q≈32 / D≈300 regime → (16,32) query + (16,320) doc chunks via
+`train_graph_short.yml`): fused+graph **1.28×/step vs stock** (1.09× over
+eager-fused) and a large memory win — **0.39× peak VRAM, 1.61 GB vs stock's
+4.15 GB (saved 2.55 GB)** vs eager-fused's 3.87 GB; losses track. The latency win
+is carried by the launch-bound (16,32) query chunks (docs at S=320 are less
+launch-bound — the eager fused tail already does well there); the memory saving
+grows with doc length (the graph's private pool packs the chunk activations, the
+per-replay copy is just token ids). The fwd+bwd regression graphs cure
+(`train_bench.py`): eager fused **0.83×** vs stock at B16/S32.
+
+**At long S, training graphs are a memory play, not a latency one** (5090, 32 GB,
+real GradCache). Latency ≈ eager-fused (the dense mask precludes the flash fast
+path — the long-S *latency* lever is `attention_backend="flash"`, Workstream D),
+but the per-step memory drops sharply:
+
+| shape | config | stock | fused+graph |
+| --- | --- | --- | --- |
+| D=1024 / Q=512 | B16, mini4 | 3.63 GB | **1.61 GB** |
+| D=2048 / Q=1024 | B32, mini8 | 11.24 GB | **2.67 GB** (4.2×) |
+| D=2048 / Q=1024 | B64, mini8 | 11.29 GB | **4.00 GB** (2.8×) |
+| D=2048 / Q=1024 | (16,2048) single chunk | 21.1 GB | **3.68 GB** (5.7×) |
+
+Caveat: graph *capture* runs one **eager** fwd+bwd of the chunk during warmup, so
+it can't capture a chunk that doesn't fit eagerly even once (at single-chunk
+`mini=batch`, D=2048/Q=1024, both OOM at batch ≈ 24). The win is on the repeated
+**replays** — keep `mini_batch_size` small (capture is cheap) and every chunk
+replays at ~4× less, freeing headroom for a larger effective batch. The rigorous
+max-batch frontier is roadmap C1.
 
 Two things to read honestly:
 

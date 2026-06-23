@@ -20,6 +20,7 @@ from flash_modernbert.errors import (
 )
 from flash_modernbert.graph import GraphConfig, no_cuda_graph, set_cuda_graph
 from flash_modernbert.prepare import prepare, unprepare
+from flash_modernbert.train_graph import TrainGraphConfig, set_train_cuda_graph
 from flash_modernbert.validate import ValidationReport, validate
 
 __all__ = [
@@ -30,6 +31,8 @@ __all__ = [
     "GraphConfig",
     "set_cuda_graph",
     "no_cuda_graph",
+    "TrainGraphConfig",
+    "set_train_cuda_graph",
     "FlashModernBertError",
     "UnsupportedTargetError",
     "ValidationError",

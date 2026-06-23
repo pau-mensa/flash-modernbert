@@ -28,6 +28,8 @@ class PatchState:
     graph_runner: Any = None        # graph._GraphRunner | None (kept loose to avoid a cycle)
     graph_enabled: bool = False
     graph_skip_warned: bool = False  # one-time warning when graphs are skipped (autocast/grad)
+    train_graph_runner: Any = None   # train_graph._TrainGraphRunner | None
+    train_graph_enabled: bool = False
 
 
 def get_state(target: object) -> PatchState:
