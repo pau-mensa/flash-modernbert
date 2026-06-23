@@ -1,0 +1,276 @@
+"""RoPE (rotary position embedding) forward kernel in CuteDSL.
+
+Drop-in for `op_apply_rope` in `reference.py`. For each (b, h, s, d):
+
+    y[..., d_low]  = x[..., d_low]  * cos[s, d_low]  - x[..., d_high] * sin[s, d_low]
+    y[..., d_high] = x[..., d_high] * cos[s, d_high] + x[..., d_low]  * sin[s, d_high]
+
+where d_low ∈ [0, D/2) and d_high = d_low + D/2. This is the "half-rotation"
+RoPE (concat-half), matching HuggingFace's ModernBert. Compute is in fp32, with
+inputs/outputs in bf16 — same as the reference.
+
+**Design (v2 — coalesced shuffle).** See `docs/fused_tail_encoder_m1.md` (M1 item 3).
+
+The naive kernel (one block per (b,h,s), thread `t` owns the pair `(t, t+D/2)`)
+and a vectorized variant that read the low and high halves as two separate
+strided streams both stall at ~12–14% HBM peak. The killer is the access
+*pattern*: packing short D=64 rows so several share a warp makes each load
+instruction's warp footprint non-contiguous (8 rows × 64-byte half-segments,
+64-byte gaps). GeGLU streams long contiguous 1152-wide rows and hits ~47%; RoPE
+could not, *not* because of the rotation math, but because of that scatter.
+
+The fix here keeps global I/O fully contiguous and resolves the low↔high pairing
+with an **intra-warp butterfly shuffle** instead of a second memory stream:
+
+- Flatten q/k to `[B*H, S, D]`; grid = (B*H, ceil(S/R)). A block owns R
+  consecutive `s` rows of one (b,h) → its rows are contiguous in memory.
+- Each thread owns ONE `vec=8` chunk (16 B) and loads only its own 8 elements,
+  so the 32 warp lanes read 256 contiguous elements per load — coalesced.
+- The rotation pairs chunk `c` (offset `c*8`) with chunk `c ^ (D/2/vec)` (the
+  other half). That partner lane's data arrives via `shuffle_sync_bfly`; no
+  second strided load. Low chunks subtract `partner*sin`, high chunks add it.
+- q AND k share the same cos/sin and the same shuffle setup in one kernel.
+
+This lands at **~29% peak / 2.34× over the v1 kernel** (87 vs 203 µs at
+B=8/S=4096). The remaining gap to GeGLU is structural and characterised in the
+doc: RoPE is *latency*-bound (D=64 rows are too short, the shuffle is mandatory,
+and it touches 4 buffers q-in/k-in/q-out/k-out) — the q+k-only ceiling is ~33%,
+cos/sin costs only ~4 points (halving it via shuffle *backfires*), splitting
+q/k into separate launches is *worse* (q-only is 23% — fewer in-flight loads per
+thread = less latency hiding), and vec=16 is far worse. cos/sin are passed as
+`[S, D]` (broadcast batch dim sliced upstream — identical across batch).
+"""
+
+from __future__ import annotations
+
+import cuda.bindings.driver as cuda_driver
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass import Float32
+from cutlass.cute.runtime import from_dlpack
+
+from flash_modernbert._kernels._compile_cache import current_cute_stream, get_compiled
+
+
+VEC = 8                  # 128-bit (8×bf16) coalesced loads/stores
+ROWS_PER_BLOCK = 8       # best on B200 sweep; smaller blocks win (latency-bound)
+
+
+def _shfl_applicable(d: int) -> bool:
+    """The shuffle path needs vec-aligned chunks whose count is a power of two
+    ≤ 32 so each row's threads sit inside one warp and the partner lane
+    (tidx ^ low_chunks) never crosses a warp boundary. True for mmBERT D=64."""
+    if d % VEC != 0:
+        return False
+    chunks = d // VEC
+    return chunks <= 32 and (chunks & (chunks - 1)) == 0
+
+
+def _build_shfl_for_d(d: int):
+    """Coalesced-shuffle kernel for a fixed head_dim D (see module docstring)."""
+    half_d = d // 2
+    chunks_per_row = d // VEC           # 8 for D=64
+    low_chunks = half_d // VEC          # 4  -> partner lane = tidx ^ low_chunks
+    threads = chunks_per_row * ROWS_PER_BLOCK
+
+    @cute.kernel
+    def kernel(
+        gq: cute.Tensor,    # [B*H, S, D]
+        gk: cute.Tensor,
+        gcos: cute.Tensor,  # [S, D]
+        gsin: cute.Tensor,
+        gq_out: cute.Tensor,
+        gk_out: cute.Tensor,
+    ):
+        bh, sb, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        dt = gq.element_type
+        s_size = cute.size(gq, mode=[1])
+        chunk = tidx % chunks_per_row
+        row_local = tidx // chunks_per_row
+        s = sb * ROWS_PER_BLOCK + row_local
+        if s < s_size:
+            d0 = chunk * VEC
+            i_base = cute.crd2idx((bh, s, d0), gq.layout)
+            i_c = cute.crd2idx((s, d0), gcos.layout)
+            cv = cute.make_rmem_tensor((VEC,), dt)
+            sv = cute.make_rmem_tensor((VEC,), dt)
+            cute.autovec_copy(cute.make_tensor(gcos.iterator + i_c, cute.make_layout(VEC)), cv)
+            cute.autovec_copy(cute.make_tensor(gsin.iterator + i_c, cute.make_layout(VEC)), sv)
+            # low chunk: out = mine*cos - partner*sin ; high chunk: + partner*sin.
+            sign = Float32(1.0)
+            if chunk < low_chunks:
+                sign = Float32(-1.0)
+            for (gin, gout) in ((gq, gq_out), (gk, gk_out)):
+                mine = cute.make_rmem_tensor((VEC,), dt)
+                out = cute.make_rmem_tensor((VEC,), dt)
+                cute.autovec_copy(
+                    cute.make_tensor(gin.iterator + i_base, cute.make_layout(VEC)), mine)
+                for j in cutlass.range_constexpr(VEC):
+                    myf = mine[j].to(Float32)
+                    pf = cute.arch.shuffle_sync_bfly(
+                        myf, offset=low_chunks, mask=-1, mask_and_clamp=31)
+                    out[j] = out.element_type(
+                        myf * cv[j].to(Float32) + sign * pf * sv[j].to(Float32))
+                cute.autovec_copy(
+                    out, cute.make_tensor(gout.iterator + i_base, cute.make_layout(VEC)))
+
+    @cute.jit
+    def launch(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        cos: cute.Tensor,
+        sin: cute.Tensor,
+        q_out: cute.Tensor,
+        k_out: cute.Tensor,
+        stream: cuda_driver.CUstream,
+    ):
+        bh_size = cute.size(q, mode=[0])
+        s_size = cute.size(q, mode=[1])
+        s_blocks = (s_size + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK
+        kernel(q, k, cos, sin, q_out, k_out).launch(
+            grid=(bh_size, s_blocks, 1),
+            block=(threads, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+def _build_scalar_for_d(d: int):
+    """Scalar fallback for head_dims the shuffle path can't take (D not a
+    power-of-two multiple of VEC). One block per (b,h,s); thread `t` owns the
+    pair (t, t+D/2). ~12% peak — only used off the mmBERT/Nomic/NeoBERT D=64 path.
+    """
+    assert d % 2 == 0, f"head_dim D={d} must be even"
+    half_d = d // 2
+
+    @cute.kernel
+    def kernel(
+        gq: cute.Tensor,
+        gk: cute.Tensor,
+        gcos: cute.Tensor,
+        gsin: cute.Tensor,
+        gq_out: cute.Tensor,
+        gk_out: cute.Tensor,
+    ):
+        b, h, s = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+
+        d_low = tidx              # 0..half_d-1
+        d_high = tidx + half_d    # half_d..d-1
+
+        # Fetch cos/sin once, share between q and k (and pair halves).
+        cos_low = gcos[s, d_low].to(Float32)
+        cos_high = gcos[s, d_high].to(Float32)
+        sin_low = gsin[s, d_low].to(Float32)
+        sin_high = gsin[s, d_high].to(Float32)
+
+        # ----- q -----
+        q_low = gq[b, h, s, d_low].to(Float32)
+        q_high = gq[b, h, s, d_high].to(Float32)
+        gq_out[b, h, s, d_low] = gq_out.element_type(q_low * cos_low - q_high * sin_low)
+        gq_out[b, h, s, d_high] = gq_out.element_type(q_high * cos_high + q_low * sin_high)
+
+        # ----- k -----
+        k_low = gk[b, h, s, d_low].to(Float32)
+        k_high = gk[b, h, s, d_high].to(Float32)
+        gk_out[b, h, s, d_low] = gk_out.element_type(k_low * cos_low - k_high * sin_low)
+        gk_out[b, h, s, d_high] = gk_out.element_type(k_high * cos_high + k_low * sin_high)
+
+    @cute.jit
+    def launch(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        cos: cute.Tensor,
+        sin: cute.Tensor,
+        q_out: cute.Tensor,
+        k_out: cute.Tensor,
+        stream: cuda_driver.CUstream,
+    ):
+        b_size = cute.size(q, mode=[0])
+        h_size = cute.size(q, mode=[1])
+        s_size = cute.size(q, mode=[2])
+        kernel(q, k, cos, sin, q_out, k_out).launch(
+            grid=(b_size, h_size, s_size),
+            block=(half_d, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+_compiled_for_d: dict[tuple[int, bool], object] = {}
+
+
+def _get_jit(d: int, shfl: bool):
+    key = (d, shfl)
+    if key not in _compiled_for_d:
+        _compiled_for_d[key] = _build_shfl_for_d(d) if shfl else _build_scalar_for_d(d)
+    return _compiled_for_d[key]
+
+
+def apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop-in replacement for `op_apply_rope` from reference.py.
+
+    `q`, `k`: [B, H, S, D]
+    `cos`, `sin`: [B, S, D] (or [1, S, D] or [S, D]) — identical across batch,
+                  the kernel only uses the [S, D] slice.
+    Returns (q_out, k_out) of same shape and dtype as q/k.
+    """
+    assert q.is_cuda and k.is_cuda and cos.is_cuda and sin.is_cuda
+    assert q.shape == k.shape, "q and k must have the same shape"
+    assert q.ndim == 4, "q must be [B, H, S, D]"
+    assert q.dtype == k.dtype == cos.dtype == sin.dtype, "all tensors must share dtype"
+
+    *_, d = q.shape
+    s = q.shape[2]
+
+    # Reduce cos/sin to a contiguous [S, D] view. HF/our reference usually
+    # ships them as [B, S, D] via .expand (zero-stride on batch); take batch 0.
+    if cos.ndim == 3:
+        cos = cos[0]
+        sin = sin[0]
+    assert cos.shape == (s, d), f"cos shape {tuple(cos.shape)} != ({s}, {d})"
+    assert sin.shape == (s, d), f"sin shape {tuple(sin.shape)} != ({s}, {d})"
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+
+    q = q.contiguous()
+    k = k.contiguous()
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+
+    shfl = _shfl_applicable(d)
+    launcher = _get_jit(d, shfl)
+    if shfl:
+        # Flatten heads: the shuffle kernel works on [B*H, S, D] so a block owns
+        # contiguous S rows of one (b,h). q is contiguous so .view is free.
+        b, h = q.shape[0], q.shape[1]
+        qk_in = (q.view(b * h, s, d), k.view(b * h, s, d))
+        qk_out = (q_out.view(b * h, s, d), k_out.view(b * h, s, d))
+        lead = 2
+    else:
+        qk_in = (q, k)
+        qk_out = (q_out, k_out)
+        lead = 3
+    args = (
+        from_dlpack(qk_in[0], assumed_align=16).mark_layout_dynamic(leading_dim=lead),
+        from_dlpack(qk_in[1], assumed_align=16).mark_layout_dynamic(leading_dim=lead),
+        from_dlpack(cos, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+        from_dlpack(sin, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+        from_dlpack(qk_out[0], assumed_align=16).mark_layout_dynamic(leading_dim=lead),
+        from_dlpack(qk_out[1], assumed_align=16).mark_layout_dynamic(leading_dim=lead),
+        current_cute_stream(),
+    )
+    # Grid is derived at runtime from q via cute.size, so B/H/S are not part of
+    # the compilation signature. D is already captured by the launcher closure.
+    compiled = get_compiled(launcher, args, key=(q.dtype, shfl))
+    compiled(*args)
+    return q_out, k_out

@@ -1,0 +1,29 @@
+# Long-S inference — the indexing / agentic-retrieval regime (long documents).
+# Here the forward is compute-bound: the eager fused tail already wins (~1.5-1.6x)
+# and graphs add a smaller increment over it (the launch floor is a smaller share
+# of a long forward). Keeps batches modest so the long sequences fit a 32 GB card.
+run:
+  validate: true
+  n_warmup: 10
+  n_iters: 30
+  n_trials: 5
+
+model:
+  name_or_path: answerdotai/ModernBERT-base
+  framework: huggingface
+  dtype: bfloat16
+
+graph:
+  pad_to: 64                # S values below are exact multiples of 64
+  max_graphs: 32
+  max_tokens: 8388608       # 2**23 — allow the long-S buckets to capture
+
+shapes:
+  - { b: 32, s: 512,  kind: doc }
+  - { b: 16, s: 1024, kind: doc }
+  - { b: 8,  s: 2048, kind: doc }
+  - { b: 4,  s: 4096, kind: doc }
+
+output:
+  dir: benchmarks/results
+  name: inference_indexing

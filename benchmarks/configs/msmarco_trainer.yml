@@ -1,0 +1,35 @@
+# Native PyLate SentenceTransformerTrainer recipe on MS MARCO triplets.
+# The two runs are identical except for the flash_modernbert.prepare() call.
+run:
+  max_steps: 60 # or set max_seconds for an iso-time run
+  max_seconds: null
+  warmup_steps: 8 # first steps excluded from the throughput median (CuteDSL JIT)
+  validate: true # run the flash-modernbert hard gate on the fused model
+
+model:
+  name_or_path: answerdotai/ModernBERT-base
+  embedding_size: 128
+  query_length: 32
+  document_length: 512
+
+dataset:
+  name: sentence-transformers/msmarco-bm25
+  split: train
+  # select: 20000           # optionally subset for a quicker data pipeline
+
+trainer:
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  learning_rate: 3.0e-5
+  bf16: true # the canonical PyLate recipe (fp32 master + bf16 autocast)
+  seed: 42
+
+loss:
+  type: cached_contrastive
+  mini_batch_size: 16
+
+cuda_graph: true
+
+output:
+  dir: benchmarks/results
+  name: msmarco_trainer
