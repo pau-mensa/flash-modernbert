@@ -255,18 +255,20 @@ the call ABI to whichever loaded.
 
 **`"auto"` is the dispatch used by the default backend when a flash kernel is
 installed.** It uses sdpa below `ops.FLASH_MIN_SEQ` and flash at or above it, decided
-per call — so short-S queries take sdpa (where flash is pure fixed-cost overhead and
-sdpa wins/ties) and long-S docs take flash (where windowed pruning wins). The
-threshold is **arch-keyed** to each arch's measured crossover — `FLASH_MIN_SEQ` =
-**128 / 512 / 1024** for sm_120 (5090) / sm_100 (B200) / sm_90 (H200), resolved once
-per process from the compute capability (unknown → 1024). It's per-arch because the
-crossover genuinely moves: at S=512, FA *wins* on the 5090 (~1.1×) and B200 (1.55×)
-but *loses* on H200 (0.64× — strong cuDNN sdpa + high FA4 floor). A single global
-1024 was really an H200-safe number that left the 5090's S128–1024 and B200's S256–512
-wins on the table. `"auto"` falls back to `"sdpa"` if no flash kernel is present, so it
-stays dependency-optional. Per-arch FA4-vs-sdpa data and the dispatch rationale:
-`benchmarks/attn_backend_micro.py` /
-`docs/roadmap.md` Workstream D.
+per call — so short-S queries take sdpa (flash's fixed cost loses there) and long-S
+docs take flash. The threshold is **arch-keyed** to each arch's measured **end-to-end**
+crossover — `FLASH_MIN_SEQ` = **256 / 1024 / 2048** for sm_120 (5090) / sm_100 (B200) /
+sm_90 (H200), resolved once per process (unknown → 1024). The datacenter values are
+higher than they look from attention alone: the end-to-end probe
+(`results/varlen_b200_h200.json`, padded, B=8) shows cute-FA4 flash *losing* until well
+past the attention-only crossover — B200 0.80× @S512 → 1.10× @S1024, H200 0.86× @S512 →
+0.83× @S1024 — because at small batch these GPUs are launch-bound and FA4's per-layer
+launch overhead dominates (its O(S²) win only surfaces at large S; at large batch the
+crossover drops). So the table is a conservative floor; a token-budget (B·S) threshold
+would also catch the large-B mid-S wins it leaves unclaimed. The 5090 (compiled FA2, low
+fixed cost) wins from mid-S, hence its low 256. `"auto"` falls back to `"sdpa"` if no
+flash kernel is present. Per-arch data + rationale: `benchmarks/{attn_backend_micro,
+varlen_bench}.py`, `results/varlen_b200_h200.json`, `docs/roadmap.md` Workstream D.
 
 Backend comparison (5090, ModernBERT-base, bf16), speedup vs stock HF, run via
 `inference_indexing_fa.yml` / `inference_short_fa.yml`:

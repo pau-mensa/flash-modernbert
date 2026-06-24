@@ -239,24 +239,32 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
 
 
 # Sequence-length threshold for the "auto" backend: at/above it flash beats sdpa,
-# below it flash's fixed-cost floor loses (the local layers can't prune enough yet).
-# The crossover is **arch-dependent**, so this is keyed on compute capability rather
-# than one global line — a single constant either regresses an arch below its
-# crossover or leaves wins on the table. Measured encoder-attention crossovers
-# (benchmarks/attn_backend_micro.py, synthesized over 8 global + 14 local layers;
-# the crossover point is backend-difference = attention only, so it carries to the
-# full forward):
+# below it flash's fixed-cost floor loses. The crossover is **arch-dependent**, so
+# this is keyed on compute capability rather than one global line. The values are the
+# measured **end-to-end** crossovers (full encoder forward, not attention in
+# isolation) — `benchmarks/{varlen_bench.py (5090), results/varlen_b200_h200.json}`:
 #
-#   sm_120 (5090, compiled FA2): ~S128  — flash ties by S256, wins by S512.
-#   sm_100 (B200, cute FA4):     ~S512  — flash wins at 512 (1.55×), loses at 256 (0.75×).
-#   sm_90  (H200, cute FA4):     ~S1024 — sdpa still wins at 512 (flash 0.64×), flash wins at 1024 (1.68×).
+#   sm_120 (5090, compiled FA2): 256  — ties ~S256, wins by S512 (B32). Low FA2 floor.
+#   sm_100 (B200, cute FA4):     1024 — loses at S512 (0.80×), wins at S1024 (1.10×).
+#   sm_90  (H200, cute FA4):     2048 — loses through S1024 (0.83×); crossover >1024.
 #
-# Unknown arch / no CUDA falls back to 1024 (the safe-everywhere line — flash wins
-# above it on every measured arch). See docs/roadmap.md Workstream D.
+# Two caveats baked into these (both push the threshold UP vs the attention-only
+# `attn_backend_micro.py` crossover, which gave an over-optimistic 128/512/1024):
+#   (1) End-to-end ≠ attention-only. The non-attention ops (GEMMs/LN/GeGLU) and the
+#       varlen unpad/repad + per-layer kernel launches dilute and offset flash's
+#       attention win, so flash needs a larger S to come out ahead than the isolated
+#       attention op does — especially on the high-fixed-cost cute-FA4 datacenter arches.
+#   (2) Batch-dependent. These were measured at small batch (B=8 on B200/H200), where
+#       those very fast GPUs are *launch-bound* (sdpa time is ~flat in S) and flash's
+#       per-layer launch overhead dominates. At larger B (compute-bound) the crossover
+#       drops. So this S-only table is a conservative floor; a token-budget (B·S)
+#       threshold would capture the large-B mid-S wins it leaves on the table.
+# H200's 2048 is conservative — measured a loss through S1024, did not measure S2048.
+# Unknown arch / no CUDA → 1024.
 _FLASH_MIN_SEQ_BY_CC = {
-    (12, 0): 128,   # sm_120 — consumer Blackwell (5090)
-    (10, 0): 512,   # sm_100 — datacenter Blackwell (B200)
-    (9, 0): 1024,   # sm_90  — Hopper (H200): strong cuDNN sdpa + high FA4 floor
+    (12, 0): 256,    # sm_120 — consumer Blackwell (5090), compiled FA2
+    (10, 0): 1024,   # sm_100 — datacenter Blackwell (B200), cute FA4
+    (9, 0): 2048,    # sm_90  — Hopper (H200), cute FA4: strong cuDNN sdpa + high FA4 floor
 }
 _FLASH_MIN_SEQ_DEFAULT = 1024
 
