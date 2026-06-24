@@ -253,8 +253,12 @@ def measure_graphed(encoder, state, params, backend, ids, mask, **measure_kwargs
     from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
 
     state.attention_backend = backend
+    # max_seq unbounded here: the bench *characterizes* the graph at every shape in
+    # the sweep (incl. S>cutoff), to map where it wins vs loses. The production
+    # default (TrainGraphConfig.max_seq=64, the queries-only gate) is a separate
+    # policy decision and is exercised by the test suite, not forced here.
     state.train_graph_runner = build_train_runner(
-        encoder, state.params, TrainGraphConfig(), backend=backend
+        encoder, state.params, TrainGraphConfig(max_seq=2 ** 31), backend=backend
     )
     state.train_graph_enabled = True
     try:

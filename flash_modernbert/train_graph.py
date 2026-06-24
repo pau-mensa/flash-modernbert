@@ -71,25 +71,33 @@ class TrainGraphConfig:
     train like the eager fused tail. Keying on exact `(B, S)` keeps the graph
     grads bit-exact to eager.
 
-    For the regime where training graphs matter most — short-S queries — PyLate's
-    query expansion pads every query to a fixed length, so a query stream is a
-    single `(B, S)` bucket and exact keying costs nothing. Variable-length doc
-    batches produce one graph per distinct shape, bounded by `max_graphs` (LRU);
-    the eager fused tail already wins at long S, so doc-side churn just falls back
-    to eager via the cap. A shape larger than `max_tokens` is never captured.
+    **`max_seq` is the policy that makes this a queries-only feature.** Training
+    graphs only win at short S; by S≈300 the eager fused tail already wins and the
+    graph loses on *both* latency (dense mask precludes the flash fast path) and
+    memory. So the runner graphs a call only when `s <= max_seq` and runs everything
+    longer eager. In ColBERT this cleanly separates queries from documents at *zero*
+    runtime cost: PyLate encodes each text group in its own forward call, so the
+    runner sees a homogeneous `(B, S)` per call — a `(B, 32)` query batch graphs, a
+    `(B, 300)` doc batch falls straight through to eager. Default 64 is a safe,
+    device-independent floor (ColBERT `query_length` is ≤64); the measured 5090
+    break-even is ~128, so raise it if you measure a higher crossover on another arch.
+
+    For the regime where training graphs matter — short-S queries — PyLate pads
+    every query to a fixed length, so a query stream is a single `(B, S)` bucket and
+    exact keying costs nothing. A shape larger than `max_tokens` is never captured.
 
     **Memory cost scales with `max_graphs`.** Every captured bucket pins its *own*
     full activation pool for the runner's lifetime (the backward graph retains the
     forward's saved tensors), so N live graphs hold N activation sets at once —
-    unlike the eager path, which reuses one chunk's peak. Measured on the realistic
-    GradCache loop, the graphed run's true (reserved) footprint is ~1.2× the eager
-    path's, *because* it pins the query-pool and doc-pool simultaneously. Training
-    graphs are a short-S **latency** win, not a memory win; keep `max_graphs` small
-    (the default covers a query bucket plus a few doc buckets). The earlier "graphs
-    halve VRAM" reading was an artifact of `max_memory_allocated`, which does not
-    count a graph's private pool — measure with `max_memory_reserved`.
+    unlike the eager path, which reuses one chunk's peak. With `max_seq` keeping
+    docs out of the cache, only the (small) query pool is pinned, so the graphed
+    footprint stays ~parity with eager. (Capturing docs too — large `max_seq` —
+    pins the doc pool as well and pushes reserved to ~1.2× eager; that "graphs halve
+    VRAM" reading was an artifact of `max_memory_allocated`, which does not count a
+    graph's private pool — always measure with `max_memory_reserved`.)
     """
 
+    max_seq: int = 64       # graph only when s <= this (queries); longer runs eager
     max_graphs: int = 4
     max_tokens: int = 2 ** 20
     warmup: int = 3
@@ -174,6 +182,15 @@ class _TrainGraphRunner:
 
     def __call__(self, input_ids: Tensor, attention_mask: Tensor | None) -> Tensor:
         b, s = input_ids.shape
+
+        # Graph only short sequences (queries). Past max_seq the graph loses to the
+        # eager fused tail on both latency (dense mask precludes flash) and memory
+        # (a captured doc pool stays pinned), so longer calls — documents — run
+        # eager and are never captured. Each PyLate forward call is one homogeneous
+        # (B, S), so this is the whole queries-vs-docs split, decided per call.
+        if s > self._config.max_seq:
+            return self._eager(input_ids, attention_mask)
+
         key = (b, s)  # exact shape — no padding (the bf16 backward is padding-sensitive)
 
         captured = self._cache.get(key)

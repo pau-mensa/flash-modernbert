@@ -67,7 +67,10 @@ def runner(encoder, params):
     graph alive that breaks the next capture)."""
     from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
 
-    return build_train_runner(encoder, params, TrainGraphConfig(warmup=3))
+    # max_seq high so every parametrized shape (incl. S=288) actually captures —
+    # this fixture tests capture/replay *fidelity*; the runtime queries-only gate
+    # (max_seq, default 64) is covered separately by test_long_seq_falls_back.
+    return build_train_runner(encoder, params, TrainGraphConfig(warmup=3, max_seq=4096))
 
 
 def _batch(b, s, vocab, seed=0):
@@ -230,6 +233,30 @@ def test_oversized_shape_falls_back_to_eager(encoder, params, weights):
     out.backward(grad_seed)
 
     assert len(runner._cache) == 0  # nothing captured
+    assert all(p.grad is not None for p in weights)
+
+
+def test_long_seq_falls_back_to_eager(encoder, params, weights):
+    """The queries-only gate: with max_seq=64, a short (query) shape is captured but
+    a long (doc) shape falls straight through to eager — the per-call queries-vs-docs
+    split. Both still produce correct grads."""
+    from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
+
+    runner = build_train_runner(encoder, params, TrainGraphConfig(max_seq=64, warmup=3))
+    vocab = encoder.config.vocab_size
+
+    q_ids, q_mask, q_grad = _batch(16, 32, vocab, seed=101)   # query: s=32 <= 64
+    d_ids, d_mask, d_grad = _batch(16, 300, vocab, seed=202)  # doc:   s=300 > 64
+
+    _zero(weights)
+    runner(q_ids, q_mask).backward(q_grad)
+    assert (16, 32) in runner._cache          # query captured
+    assert all(p.grad is not None for p in weights)
+
+    _zero(weights)
+    runner(d_ids, d_mask).backward(d_grad)
+    assert (16, 300) not in runner._cache     # doc never captured (ran eager)
+    assert len(runner._cache) == 1            # only the query bucket lives
     assert all(p.grad is not None for p in weights)
 
 

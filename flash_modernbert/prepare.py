@@ -31,6 +31,7 @@ def prepare(
     *,
     cuda_graph: bool | GraphConfig = False,
     train_cuda_graph: bool | TrainGraphConfig = False,
+    cuda_graph_seq_cutoff: int = 64,
     attention_backend: str = "sdpa",
     validate: bool = True,
 ) -> object:
@@ -51,6 +52,17 @@ def prepare(
     into persistent `.grad` buffers) and feed exact `(B, S)` shapes (the bf16
     backward is padding-sensitive, so the runner does not bucket the sequence).
 
+    `cuda_graph_seq_cutoff` (default 64) bounds *which* calls the training runner
+    graphs: only sequences with `s <= cutoff` are captured; longer ones run eager.
+    Training graphs win only at short S (by S≈300 the eager fused tail wins on both
+    latency and memory), so this keeps graphs on the **queries** and off the
+    **documents** — and since PyLate encodes each text group in its own forward
+    call, that split happens automatically per call, at no runtime cost. 64 is a
+    safe device-independent floor (ColBERT `query_length` ≤64); the 5090 break-even
+    is ~128, so raise it if a longer crossover is measured on another arch. (Passing
+    an explicit `TrainGraphConfig` as `train_cuda_graph` overrides this via its own
+    `max_seq` field.)
+
     `attention_backend` selects the attention kernel: `"sdpa"` (default,
     dependency-free, dense-mask) or `"flash"` (FlashAttention with sliding-window
     pruning on local layers — needs the flash-attn package and targets unpadded
@@ -67,7 +79,7 @@ def prepare(
         if cuda_graph and existing.graph_runner is None:
             _enable_graphs(encoder, existing, cuda_graph)
         if train_cuda_graph and existing.train_graph_runner is None:
-            _enable_train_graphs(encoder, existing, train_cuda_graph)
+            _enable_train_graphs(encoder, existing, train_cuda_graph, cuda_graph_seq_cutoff)
         return target
 
     if validate:
@@ -83,7 +95,7 @@ def prepare(
     if cuda_graph:
         _enable_graphs(encoder, state, cuda_graph)
     if train_cuda_graph:
-        _enable_train_graphs(encoder, state, train_cuda_graph)
+        _enable_train_graphs(encoder, state, train_cuda_graph, cuda_graph_seq_cutoff)
 
     setattr(encoder, ATTR, state)
     encoder.forward = _make_forward(encoder, state)
@@ -99,11 +111,16 @@ def _enable_graphs(encoder: nn.Module, state: PatchState, cuda_graph: bool | Gra
 
 
 def _enable_train_graphs(
-    encoder: nn.Module, state: PatchState, train_cuda_graph: bool | TrainGraphConfig
+    encoder: nn.Module,
+    state: PatchState,
+    train_cuda_graph: bool | TrainGraphConfig,
+    seq_cutoff: int = 64,
 ) -> None:
+    # An explicit config wins as-is; a bare `True` gets the default config with the
+    # caller's seq cutoff threaded into max_seq (the queries-only gate).
     config = (
         train_cuda_graph if isinstance(train_cuda_graph, TrainGraphConfig)
-        else TrainGraphConfig()
+        else TrainGraphConfig(max_seq=seq_cutoff)
     )
     state.train_graph_runner = build_train_runner(
         encoder, state.params, config, backend=state.attention_backend
