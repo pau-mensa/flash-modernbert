@@ -131,6 +131,32 @@ def test_batch_over_max_falls_back_to_eager(encoder, params):
     assert len(runner._cache) == 0  # nothing captured — went straight to eager
 
 
+def test_seq_cutoff_routes_long_to_eager(encoder, params):
+    """max_seq is the short-S gate: a call with s <= max_seq is captured, a longer
+    one runs eager and is never captured (the inference queries-vs-docs split).
+    Both stay numerically correct."""
+    from flash_modernbert.graph import GraphConfig, build_runner
+
+    vocab = int(encoder.config.vocab_size)
+    runner = build_runner(encoder, params, GraphConfig(pad_to=32, max_seq=64))
+
+    with torch.no_grad():
+        # short query (s=32 <= 64) → graphed; compare to the captured (dense-mask)
+        # region via _replay_ref, not _fused (which would fold in the flash-vs-dense
+        # band — a fused-tail property, not a graph one).
+        q_ids, q_mask = _batch(8, 32, vocab, seed=1)
+        out_q = runner(q_ids, q_mask)
+        assert _cos(out_q, _replay_ref(encoder, params, q_ids, q_mask, bb=8, sb=32)) >= FIDELITY
+        assert (8, 32) in runner._cache               # captured
+
+        # long doc (s=320 > 64) → eager fused tail (exactly _fused, so ~bit-equal)
+        d_ids, d_mask = _batch(8, 320, vocab, seed=2)
+        out_d = runner(d_ids, d_mask)
+        assert _cos(out_d, _fused(encoder, params, d_ids, d_mask)) >= FIDELITY
+
+    assert len(runner._cache) == 1                     # only the short bucket; doc ran eager
+
+
 def test_per_b_graphs_when_max_batch_none(encoder, params):
     from flash_modernbert.graph import GraphConfig, build_runner
 

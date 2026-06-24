@@ -52,16 +52,19 @@ def prepare(
     into persistent `.grad` buffers) and feed exact `(B, S)` shapes (the bf16
     backward is padding-sensitive, so the runner does not bucket the sequence).
 
-    `cuda_graph_seq_cutoff` (default 64) bounds *which* calls the training runner
-    graphs: only sequences with `s <= cutoff` are captured; longer ones run eager.
-    Training graphs win only at short S (by S≈300 the eager fused tail wins on both
-    latency and memory), so this keeps graphs on the **queries** and off the
-    **documents** — and since PyLate encodes each text group in its own forward
-    call, that split happens automatically per call, at no runtime cost. 64 is a
-    safe device-independent floor (ColBERT `query_length` ≤64); the 5090 break-even
-    is ~128, so raise it if a longer crossover is measured on another arch. (Passing
-    an explicit `TrainGraphConfig` as `train_cuda_graph` overrides this via its own
-    `max_seq` field.)
+    `cuda_graph_seq_cutoff` (default 64) bounds *which* calls get graphed when the
+    runner is enabled via the bool shortcut (`cuda_graph=True` / `train_cuda_graph=
+    True`): only sequences with `s <= cutoff` are captured; longer ones run eager.
+    Graphs win only at short S (by S≈300 the eager fused tail wins on latency, and —
+    measured on reserved memory, not allocated — graphs don't save memory either),
+    so this keeps graphs on the **queries** and off the **documents**. Since PyLate
+    encodes each text group in its own forward call, that split happens
+    automatically per call at no runtime cost. 64 is a safe device-independent floor
+    (ColBERT `query_length` ≤64); the 5090 break-even is ~128, so raise it if a
+    longer crossover is measured on another arch. Passing an explicit `GraphConfig`
+    / `TrainGraphConfig` overrides this via that config's own `max_seq` (which
+    defaults to None for inference — so long-S **indexing** configs with
+    `seq_buckets` keep graphing — and 64 for training).
 
     `attention_backend` selects the attention kernel: `"sdpa"` (default,
     dependency-free, dense-mask) or `"flash"` (FlashAttention with sliding-window
@@ -77,7 +80,7 @@ def prepare(
     existing = getattr(encoder, ATTR, None)
     if existing is not None:  # idempotent — only (re)configure graphs if asked
         if cuda_graph and existing.graph_runner is None:
-            _enable_graphs(encoder, existing, cuda_graph)
+            _enable_graphs(encoder, existing, cuda_graph, cuda_graph_seq_cutoff)
         if train_cuda_graph and existing.train_graph_runner is None:
             _enable_train_graphs(encoder, existing, train_cuda_graph, cuda_graph_seq_cutoff)
         return target
@@ -93,7 +96,7 @@ def prepare(
         attention_backend=attention_backend,
     )
     if cuda_graph:
-        _enable_graphs(encoder, state, cuda_graph)
+        _enable_graphs(encoder, state, cuda_graph, cuda_graph_seq_cutoff)
     if train_cuda_graph:
         _enable_train_graphs(encoder, state, train_cuda_graph, cuda_graph_seq_cutoff)
 
@@ -102,8 +105,19 @@ def prepare(
     return target
 
 
-def _enable_graphs(encoder: nn.Module, state: PatchState, cuda_graph: bool | GraphConfig) -> None:
-    config = cuda_graph if isinstance(cuda_graph, GraphConfig) else GraphConfig()
+def _enable_graphs(
+    encoder: nn.Module,
+    state: PatchState,
+    cuda_graph: bool | GraphConfig,
+    seq_cutoff: int | None = None,
+) -> None:
+    # An explicit GraphConfig wins as-is (incl. its own max_seq, default None so
+    # long-S indexing configs keep graphing). A bare `True` gets the default config
+    # with the caller's seq cutoff applied — the safe short-S-serving default.
+    config = (
+        cuda_graph if isinstance(cuda_graph, GraphConfig)
+        else GraphConfig(max_seq=seq_cutoff)
+    )
     state.graph_runner = build_runner(
         encoder, state.params, config, backend=state.attention_backend
     )

@@ -150,8 +150,15 @@ def _last_hidden(out):
 
 
 def measure(call, ids, mask, *, n_warmup: int, n_iters: int, n_trials: int) -> dict:
-    """Median ms/call over `n_trials` trials of `n_iters` calls each, plus the
-    peak memory allocated across the measured window."""
+    """Median ms/call over `n_trials` trials of `n_iters` calls each, plus peak
+    allocated AND reserved memory across the measured window.
+
+    Reserved matters because a captured graph keeps its activations in a private
+    pool that `max_memory_allocated` does NOT count but `max_memory_reserved` does —
+    so an allocated-only comparison credits graphs with a memory win that isn't
+    real. `empty_cache()` before warmup releases the previous variant/shape's cached
+    segments so reserved reflects only this measurement (it is otherwise sticky)."""
+    torch.cuda.empty_cache()
     for _ in range(n_warmup):
         call(ids, mask)
     torch.cuda.synchronize()
@@ -171,6 +178,7 @@ def measure(call, ids, mask, *, n_warmup: int, n_iters: int, n_trials: int) -> d
         "ms_min": min(times_ms),
         "ms_max": max(times_ms),
         "peak_mb": torch.cuda.max_memory_allocated() / 1e6,
+        "peak_reserved_mb": torch.cuda.max_memory_reserved() / 1e6,
     }
 
 
@@ -250,7 +258,7 @@ def run(cfg: Config, device: torch.device) -> dict:
             print(
                 f"  {name:<15s} {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d} "
                 f"{r['ms']:7.3f} ms  {r['samples_per_s']:9.0f} samp/s  "
-                f"{r['peak_mb']:7.0f} MB"
+                f"alloc {r['peak_mb']:6.0f} / resv {r['peak_reserved_mb']:6.0f} MB"
             )
         print()
 
@@ -305,6 +313,7 @@ def _graph_config(cfg: Config) -> GraphConfig:
         seq_buckets=tuple(seq_buckets) if seq_buckets else None,
         max_graphs=int(section.get("max_graphs", defaults.max_graphs)),
         max_tokens=int(section.get("max_tokens", defaults.max_tokens)),
+        max_seq=section.get("max_seq", defaults.max_seq),  # None = graph all; set to gate long S to eager
         warmup=int(section.get("warmup", defaults.warmup)),
     )
 
@@ -403,6 +412,32 @@ def main():
             f"{v} {r['variants'][v]['speedup']:.2f}x" for v in speedup_variants
         )
         print(f"  {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d}  {parts}")
+
+    # Isolated CUDA-graph impact: graphed[b] vs its eager-fused[b] baseline, on
+    # speed AND reserved memory (the graph-fair footprint — allocated hides the
+    # pool). This is where you see the short-S latency win and that the long-S
+    # "memory win" is not real on reserved.
+    graph_variants = [v for v in payload["variants"] if v.startswith("graphed[")]
+    if graph_variants:
+        print("\n=== CUDA-graph impact (graphed vs eager-fused; speed + reserved MB) ===")
+        for r in payload["rows"]:
+            sh = r["shape"]
+            for gv in graph_variants:
+                fv = "fused[" + gv[len("graphed["):]
+                g = r["variants"].get(gv)
+                f = r["variants"].get(fv)
+                if g is None or f is None:
+                    continue
+                speed = f["ms"] / g["ms"]
+                gr = g.get("peak_reserved_mb", float("nan"))
+                fr = f.get("peak_reserved_mb", float("nan"))
+                mem = gr / fr if fr else float("nan")
+                print(
+                    f"  {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d}  {gv}: "
+                    f"{speed:.2f}x vs eager-fused, "
+                    f"resv {gr:.0f} vs {fr:.0f} MB ({mem:.2f}x); "
+                    f"alloc {g['peak_mb']:.0f} vs {f['peak_mb']:.0f} MB (excludes graph pool)"
+                )
     print(f"\nwrote {json_path}\nwrote {png_path}")
 
 

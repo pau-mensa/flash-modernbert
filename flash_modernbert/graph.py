@@ -79,6 +79,18 @@ class GraphConfig:
     new bucket evicts the least-recently-replayed one (freeing its graph), so the
     hot working set stays graphed even under an unbounded stream of shapes. A
     single shape larger than `max_tokens` is never captured (always eager).
+
+    `max_seq` (default None = no cutoff, graph any length) gates by sequence length:
+    a call with `s > max_seq` runs eager and is never captured. Graphs win at short
+    S (the launch-floor collapse) but at long S the eager fused tail is faster
+    (a captured graph needs a static dense mask, which precludes SDPA's flash fast
+    path) and — measured with `max_memory_reserved`, not `allocated` — graphs do not
+    actually save memory there either (the private pool is real, just invisible to
+    `allocated`). So for short-S query *serving* a cutoff routes long docs to the
+    faster eager path at no cost. It is left None by default so explicit long-S
+    *indexing* configs (`seq_buckets` + `max_batch`) keep graphing as before;
+    `prepare(cuda_graph=True, cuda_graph_seq_cutoff=...)` sets it for the plain
+    bool-enable path.
     """
 
     pad_to: int = 64
@@ -86,6 +98,7 @@ class GraphConfig:
     seq_buckets: tuple[int, ...] | None = None
     max_graphs: int = 32
     max_tokens: int = 2 ** 20
+    max_seq: int | None = None
     warmup: int = 3
 
 
@@ -150,6 +163,9 @@ class _GraphRunner:
 
     def __call__(self, input_ids: Tensor, attention_mask: Tensor | None) -> Tensor:
         b, s = input_ids.shape
+        max_seq = self._config.max_seq
+        if max_seq is not None and s > max_seq:
+            return self._eager(input_ids, attention_mask)  # long S: eager fused is faster, no mem win
         max_batch = self._config.max_batch
         if max_batch is not None and b > max_batch:
             return self._eager(input_ids, attention_mask)  # batch too large for the bucket
