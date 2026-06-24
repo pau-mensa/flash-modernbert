@@ -232,15 +232,32 @@ Three honest takeaways:
 fused tail competitive there) and whenever peak memory is the constraint. For
 long-S document indexing, the `flash` attention backend below is the bigger lever.
 
-### attention_backend="flash" — windowed FlashAttention for long S
+### attention_backend — `sdpa` (default) | `flash` | `auto`
 
 The sdpa speedup *shrinks* as S grows because the sliding-window local layers
 (≈2/3 of the model) are expressed as a dense `S×S` mask and run full O(S²).
 `prepare(model, attention_backend="flash")` swaps attention for FlashAttention,
 which takes the window as *structure* (`window_size`) and prunes the local layers
-to the band — O(S·W) — instead of masking. It needs the `flash-attn` package and
-targets unpadded inference (queries with expansion, fixed-length docs); the
-default `"sdpa"` backend is dependency-free and handles padded batches.
+to the band — O(S·W) — instead of masking. It targets unpadded inference (queries
+with expansion, fixed-length docs); the default `"sdpa"` backend is dependency-free
+and handles padded batches.
+
+**Arch-aware kernel.** The flash path picks the right kernel per GPU: CuteDSL
+**FA4** on sm_90 / sm_100 (`pip install flash-attn-4`, the per-arch SOTA — needs
+`nvidia-cutlass-dsl==4.5.2` + `quack-kernels==0.5.0` pinned alongside
+`flash-attn-4==4.0.0b16`), and **compiled** flash-attn on sm_120 (`pip install
+flash-attn`, since FA4-cute has no consumer-Blackwell kernel). The package adapts
+the call ABI to whichever loaded.
+
+**`"auto"` is the recommended setting when a flash kernel is installed.** It uses
+sdpa below `ops.FLASH_MIN_SEQ` (1024) and flash at or above it, decided per call —
+so short-S queries take sdpa (where flash is pure fixed-cost overhead and sdpa
+wins/ties on every arch) and long-S docs take flash (where windowed pruning wins).
+The threshold is device-independent: 1024 is at-or-past the measured crossover on
+every arch (≈S512 on B200, ≈S1024 on H200). `"auto"` falls back to `"sdpa"` if no
+flash kernel is present, so it stays dependency-optional. Per-arch FA4-vs-sdpa
+data and the dispatch rationale: `benchmarks/attn_backend_micro.py` /
+`docs/roadmap.md` Workstream D.
 
 Backend comparison (5090, ModernBERT-base, bf16), speedup vs stock HF, run via
 `inference_indexing_fa.yml` / `inference_short_fa.yml`:

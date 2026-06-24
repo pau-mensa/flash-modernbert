@@ -238,30 +238,72 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
     return out.reshape(b, s, -1)
 
 
-_flash_attn_func = None
+# Cross-arch-safe sequence-length threshold for the "auto" backend: use flash only
+# once S is comfortably past the sliding window, where the local layers actually
+# prune (O(S·W) < O(S²)) by enough to clear FlashAttention's fixed-cost floor. The
+# measured encoder-attention crossover is ~S512 on B200 (sm_100) and ~S1024 on H200
+# (sm_90), so below 1024 sdpa is parity-or-better on every arch and above it flash
+# wins — one device-independent line (see docs/roadmap.md Workstream D).
+FLASH_MIN_SEQ = 1024
+
+
+_flash_attn = None  # cached (func, kind) where kind in {"cute", "compiled"}
+
+
+def _import_cute_flash():
+    from flash_attn.cute import flash_attn_func  # CuteDSL FA4 (sm_90/100/110)
+
+    return flash_attn_func, "cute"
+
+
+def _import_compiled_flash():
+    from flash_attn import flash_attn_func  # compiled FA2/FA3 (incl. sm_120 / PTX)
+
+    return flash_attn_func, "compiled"
 
 
 def _load_flash_attn():
-    """Import flash_attn lazily so the dependency is only required when the flash
-    backend is actually selected (the default sdpa path stays dependency-free)."""
-    global _flash_attn_func
-    if _flash_attn_func is None:
+    """Resolve the flash kernel for *this* GPU, lazily (so the default sdpa path
+    stays dependency-free) and cached. The right kernel is arch-dependent:
+
+    - sm_90 / sm_100 (Hopper / datacenter Blackwell): CuteDSL **FA4**
+      (`pip install flash-attn-4`), the per-arch SOTA, built on wgmma / tcgen05.
+    - sm_120 (consumer Blackwell): FA4-cute has no kernel (no tcgen05), so the
+      **compiled** flash-attn FA2 path (`pip install flash-attn`, runs from PTX).
+
+    Tries the arch-appropriate kernel first, then the other, and raises only if
+    neither imports. Returns `(func, kind)`; `kind` selects the call ABI in
+    `flash_attention` (the cute and compiled `flash_attn_func` differ)."""
+    global _flash_attn
+    if _flash_attn is not None:
+        return _flash_attn
+    major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+    if major == 12:
+        order = [_import_compiled_flash]  # cute FA4 has no sm_120 kernel
+    elif major in (9, 10, 11):
+        order = [_import_cute_flash, _import_compiled_flash]
+    else:
+        order = [_import_compiled_flash, _import_cute_flash]
+    errors = []
+    for importer in order:
         try:
-            from flash_attn import flash_attn_func
+            _flash_attn = importer()
+            return _flash_attn
         except ImportError as exc:  # pragma: no cover - import-time guard
-            raise ImportError(
-                "attention_backend='flash' needs the flash-attn package "
-                "(pip install flash-attn). The default 'sdpa' backend needs nothing."
-            ) from exc
-        _flash_attn_func = flash_attn_func
-    return _flash_attn_func
+            errors.append(f"{importer.__name__}: {exc}")
+    raise ImportError(
+        "attention_backend='flash'/'auto' needs a FlashAttention kernel: "
+        "flash-attn-4 on sm_90/sm_100 (pip install flash-attn-4) or flash-attn on "
+        "sm_120 (pip install flash-attn). The default 'sdpa' backend needs neither. "
+        "Tried: " + "; ".join(errors)
+    )
 
 
 def flash_attention(q, k, v, window, scaling):
     """FlashAttention with the layer's *structure* (window) instead of a dense
-    mask: `window=(-1, -1)` is full attention (global layers), `window=(w, w)` is
-    a symmetric sliding band `|i - j| <= w` (local layers), which FA prunes to the
-    band rather than computing the full `S×S` — the long-S win.
+    mask: full attention (global layers) is `window=(-1, -1)`, and `window=(w, w)`
+    is a symmetric sliding band `|i - j| <= w` (local layers), which FA prunes to
+    the band rather than computing the full `S×S` — the long-S win.
 
     q/k/v arrive as the [B, H, S, D] transpose views the rest of the tail uses;
     FA wants [B, S, H, D]. The `.transpose(1, 2)` back is a free view — and FA
@@ -269,19 +311,41 @@ def flash_attention(q, k, v, window, scaling):
     contiguous [B, H, S, D], and v's unbind view keeps D packed), so we pass the
     strided views directly with no copy. Assumes an unpadded batch — padding would
     need `flash_attn_varlen_func` with cu_seqlens; sdpa remains the path for that.
+
+    The cute (FA4) and compiled (FA2) `flash_attn_func` differ in ABI: compiled
+    takes `dropout_p` and spells full attention `(-1, -1)`; cute takes neither,
+    spells it `(None, None)`, and returns `(out, lse)`. `_load_flash_attn` reports
+    which kind loaded, and we adapt the call accordingly.
     """
-    flash_attn_func = _load_flash_attn()
-    out = flash_attn_func(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-        dropout_p=0.0, softmax_scale=scaling, causal=False, window_size=window,
-    )
+    func, kind = _load_flash_attn()
+    qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    if kind == "cute":
+        w = (None, None) if window == (-1, -1) else window
+        out = func(qt, kt, vt, softmax_scale=scaling, causal=False, window_size=w)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+    else:
+        out = func(
+            qt, kt, vt, dropout_p=0.0, softmax_scale=scaling,
+            causal=False, window_size=window,
+        )
     b, s = out.shape[:2]
     return out.reshape(b, s, -1)
 
 
 def attention(q, k, v, *, mask, window, scaling, backend):
     """Dispatch attention to the selected backend. `mask` feeds sdpa; `window`
-    feeds flash. Both are precomputed per layer so this stays a thin switch."""
+    feeds flash; both are precomputed per layer so this stays a thin switch.
+
+    `"auto"` resolves per call from `q`'s sequence length: flash for `S >=
+    FLASH_MIN_SEQ` (long-S docs, where windowed pruning wins on every arch) and
+    sdpa below (short-S queries, where flash is pure fixed-cost overhead and sdpa
+    wins or ties). Resolving here — at the leaf, where S is known — means a
+    captured graph bakes in the right path per `(B, S)` bucket. `"auto"` assumes a
+    flash kernel is loadable; `prepare()` downgrades it to `"sdpa"` up front when
+    none is, so this never imports mid-capture."""
+    if backend == "auto":
+        backend = "flash" if q.shape[2] >= FLASH_MIN_SEQ else "sdpa"
     if backend == "flash":
         return flash_attention(q, k, v, window, scaling)
     return sdpa_attention(q, k, v, mask, scaling)

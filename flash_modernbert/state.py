@@ -24,7 +24,7 @@ ATTR = "_flash_modernbert"
 class PatchState:
     params: ModernBertParams
     original_forward: Callable[..., Any]
-    attention_backend: str = "sdpa"  # "sdpa" (default, dependency-free) | "flash"
+    attention_backend: str = "sdpa"  # "sdpa" (default, dep-free) | "flash" | "auto" (sdpa<FLASH_MIN_SEQ, flash above)
     graph_runner: Any = None        # graph._GraphRunner | None (kept loose to avoid a cycle)
     graph_enabled: bool = False
     graph_skip_warned: bool = False  # one-time warning when graphs are skipped (autocast/grad)

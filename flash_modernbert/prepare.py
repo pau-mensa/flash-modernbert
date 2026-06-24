@@ -16,6 +16,7 @@ import torch
 from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutput
 
+from flash_modernbert import ops
 from flash_modernbert.config import ModernBertParams
 from flash_modernbert.errors import FlashModernBertError
 from flash_modernbert.forward import fused_forward
@@ -66,14 +67,24 @@ def prepare(
     defaults to None for inference — so long-S **indexing** configs with
     `seq_buckets` keep graphing — and 64 for training).
 
-    `attention_backend` selects the attention kernel: `"sdpa"` (default,
-    dependency-free, dense-mask) or `"flash"` (FlashAttention with sliding-window
-    pruning on local layers — needs the flash-attn package and targets unpadded
-    inference). `validate` runs the hard gate during prepare.
+    `attention_backend` selects the attention kernel:
+
+    - `"sdpa"` (default, dependency-free, dense-mask) — wins or ties at short S and
+      is the only path that handles padded batches; the safe universal choice.
+    - `"flash"` — FlashAttention with sliding-window pruning on the local layers
+      (O(S·W) vs O(S²)); the big win at long S. Needs a flash kernel (FA4-cute on
+      sm_90/sm_100, compiled flash-attn on sm_120) and targets unpadded inference.
+    - `"auto"` — the recommended setting when a flash kernel is installed: sdpa
+      below `ops.FLASH_MIN_SEQ` (short-S queries), flash at or above it (long-S
+      docs), decided per call. Falls back to `"sdpa"` if no flash kernel is present,
+      so it stays dependency-optional.
+
+    `validate` runs the hard gate during prepare.
     """
-    if attention_backend not in ("sdpa", "flash"):
+    if attention_backend not in ("sdpa", "flash", "auto"):
         raise FlashModernBertError(
-            f"attention_backend must be 'sdpa' or 'flash', got {attention_backend!r}"
+            "attention_backend must be 'sdpa', 'flash', or 'auto', got "
+            f"{attention_backend!r}"
         )
     encoder = find_encoder(target)
 
@@ -90,6 +101,8 @@ def prepare(
     else:
         _require_cuda(encoder)
 
+    attention_backend = _resolve_attention_backend(attention_backend)
+
     params = ModernBertParams.from_hf_config(encoder.config)
     state = PatchState(
         params=params, original_forward=encoder.forward,
@@ -103,6 +116,27 @@ def prepare(
     setattr(encoder, ATTR, state)
     encoder.forward = _make_forward(encoder, state)
     return target
+
+
+def _resolve_attention_backend(backend: str) -> str:
+    """Confirm a flash kernel is importable up front for `"flash"`/`"auto"`, so a
+    captured graph never hits a mid-capture `ImportError`. `"flash"` raises if none
+    is available (the user asked for it explicitly); `"auto"` downgrades to
+    `"sdpa"` with a warning, keeping it dependency-optional. `"sdpa"` is a no-op."""
+    if backend == "sdpa":
+        return backend
+    try:
+        ops._load_flash_attn()
+    except ImportError as exc:
+        if backend == "flash":
+            raise FlashModernBertError(str(exc)) from exc
+        warnings.warn(
+            f"attention_backend='auto' but no FlashAttention kernel is available "
+            f"({exc}); falling back to 'sdpa'.",
+            stacklevel=2,
+        )
+        return "sdpa"
+    return backend
 
 
 def _enable_graphs(
