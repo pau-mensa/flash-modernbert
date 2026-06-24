@@ -35,7 +35,7 @@ loss:
   mini_batch_size: 16 # → chunks of (16, 32) queries and (16, 128) docs
 
 cuda_graph: false # inference graphs (no-grad) — off here
-train_cuda_graph: true # training-step graphs — the thing under test
+train_cuda_graph: false # training-step graphs — the thing under test
 
 shapes:
   - { b: 16, s: 32, kind: query }

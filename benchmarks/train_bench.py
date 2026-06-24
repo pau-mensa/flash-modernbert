@@ -33,14 +33,29 @@ is most at risk and where graphs would help most.
 
     stock      — the unpatched Hugging Face forward (SDPA attention)
     fused[b]   — flash_modernbert.prepare(model): the eager fused tail, backend b
+    graph[b]   — the eager fused tail with **training-step CUDA graphs**: the
+                 encoder fwd+bwd captured once per shape and replayed (the
+                 `_TrainGraphRunner`). Emitted only when `train_cuda_graph: true`
+                 is set in the config. Each shape uses a *fresh* runner so its one
+                 captured graph pair is weighed in isolation (no long-S pools
+                 stacking up to OOM, and the peak reading is that shape's graph
+                 alone).
 
 The step is `out = encoder(ids, mask); out.float().square().mean().backward()`
 with grads zeroed each step — a synthetic upstream loss that touches every
 encoder parameter, so the backward exercises the full fused-tail gradient path
 without dragging in a framework-specific head. Reports ms/step and peak memory
-per (variant, shape), plus fused-over-stock speedup, and writes a JSON + chart.
+per (variant, shape), the speedup vs stock, and — when graphs are on — the
+graph-vs-eager-fused speed/memory delta (the isolated training-graph impact);
+writes a JSON + chart.
 
-    uv run benchmarks/train_bench.py benchmarks/configs/train_short.yml
+    uv run benchmarks/train_bench.py benchmarks/configs/train_short.yml          # stock vs eager-fused
+    uv run benchmarks/train_bench.py benchmarks/configs/train_graph_short.yml    # + graph[sdpa]
+
+The `graph[b]` variant must zero `.grad` in place (never to None) — the captured
+backward replays an add into the persistent `param.grad` address, so the buffer
+has to stay live (the `set_to_none=False` training-graph invariant). The stock /
+eager steps are free to drop grads to None.
 
 This is the encoder fwd+bwd in isolation (pre-tokenized batches at exact shapes);
 the full GradCache training step (with the projection head, scoring, and the
@@ -135,7 +150,13 @@ def _zero_grads(params):
 
 def measure(step, ids, mask, *, n_warmup: int, n_iters: int, n_trials: int) -> dict:
     """Median ms/step over `n_trials` trials of `n_iters` fwd+bwd steps each, plus
-    the peak memory allocated across the measured window."""
+    peak allocated AND reserved memory across the measured window.
+
+    `empty_cache()` before warmup releases the allocator's cached segments from the
+    previous shape/variant, so the *reserved* high-water reflects only this
+    measurement — otherwise reserved is sticky (a small shape inherits a big prior
+    shape's reservation) and graph-vs-eager reserved comparisons are meaningless."""
+    torch.cuda.empty_cache()
     for _ in range(n_warmup):
         step(ids, mask)
     torch.cuda.synchronize()
@@ -155,6 +176,12 @@ def measure(step, ids, mask, *, n_warmup: int, n_iters: int, n_trials: int) -> d
         "ms_min": min(times_ms),
         "ms_max": max(times_ms),
         "peak_mb": torch.cuda.max_memory_allocated() / 1e6,
+        # Reserved, not just allocated: a captured graph keeps its activations in a
+        # private pool that `max_memory_allocated` does NOT count but
+        # `max_memory_reserved` does. Comparing graph vs eager on allocated alone
+        # makes graphs look ~10× cheaper than they are — reserved is the true,
+        # graph-fair footprint (what actually decides OOM / max batch).
+        "peak_reserved_mb": torch.cuda.max_memory_reserved() / 1e6,
     }
 
 
@@ -187,6 +214,57 @@ def variant_steps(model_obj, encoder, validate: bool, backends):
         yield f"fused[{b}]", patched
 
     _zero_grads(params)
+
+
+def _zero_grads_inplace(params):
+    """Zero every live `.grad` in a single fused multi-tensor launch (what a real
+    `optimizer.zero_grad(set_to_none=False)` does). The training-graph backward
+    replays an add into the *address* of each persistent `param.grad`, so the
+    buffers must stay live across steps — unlike `_zero_grads`, which drops them to
+    None. `_foreach_zero_` keeps this to ~one launch so it doesn't dominate the
+    launch-bound short-S step we are trying to measure."""
+    grads = [p.grad for p in params if p.grad is not None]
+    if grads:
+        torch._foreach_zero_(grads)
+
+
+def graph_step(encoder, params):
+    """A fwd+bwd step routed through the training-graph runner: zero grads in place,
+    run the (now graph-replayed) encoder forward, backprop the same square-mean
+    synthetic loss. `loss.backward()` drives `_TrainGraphFn.backward`, which
+    replays the captured backward graph (accumulating into the live `.grad`)."""
+    def step(ids, mask):
+        _zero_grads_inplace(params)
+        out = _last_hidden(encoder.forward(input_ids=ids, attention_mask=mask))
+        loss = out.float().square().mean()
+        loss.backward()
+    return step
+
+
+def measure_graphed(encoder, state, params, backend, ids, mask, **measure_kwargs):
+    """Measure one shape through a *fresh* training-graph runner, then tear it down.
+
+    Fresh-per-shape keeps exactly one captured fwd+bwd graph pair alive at a time,
+    so the long-S buckets (whose private pools are GBs) don't stack up and OOM, and
+    the peak reading is this shape's graph in isolation. Capture runs inside
+    `measure`'s warmup — before `reset_peak_memory_stats` — so the reported peak is
+    the steady-state *replay* footprint (the graph's packed activation pool),
+    directly comparable to the eager variant's transient fwd+bwd peak."""
+    from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
+
+    state.attention_backend = backend
+    state.train_graph_runner = build_train_runner(
+        encoder, state.params, TrainGraphConfig(), backend=backend
+    )
+    state.train_graph_enabled = True
+    try:
+        return measure(graph_step(encoder, params), ids, mask, **measure_kwargs)
+    finally:
+        state.train_graph_enabled = False
+        state.train_graph_runner = None
+        _zero_grads(params)
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +304,40 @@ def run(cfg: Config, device: torch.device) -> dict:
             print(
                 f"  {name:<14s} {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d} "
                 f"{r['ms']:8.3f} ms  {r['samples_per_s']:9.0f} samp/s  "
-                f"{r['peak_mb']:7.0f} MB"
+                f"alloc {r['peak_mb']:6.0f} / resv {r['peak_reserved_mb']:6.0f} MB"
             )
         print()
+
+    if bool(cfg.raw.get("train_cuda_graph", False)):
+        from flash_modernbert.state import get_state
+
+        state = get_state(model_obj)
+        params = list(encoder.parameters())
+        for b in backends:
+            name = f"graph[{b}]"
+            results[name] = {}
+            for i, sh in enumerate(shapes):
+                ids, mask = batches[i]
+                try:
+                    r = measure_graphed(
+                        encoder, state, params, b, ids, mask, **measure_kwargs
+                    )
+                    r["samples_per_s"] = sh["b"] * 1e3 / r["ms"]
+                    print(
+                        f"  {name:<14s} {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d} "
+                        f"{r['ms']:8.3f} ms  {r['samples_per_s']:9.0f} samp/s  "
+                        f"alloc {r['peak_mb']:6.0f} / resv {r['peak_reserved_mb']:6.0f} MB"
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    nan = float("nan")
+                    r = {"ms": nan, "ms_min": nan, "ms_max": nan,
+                         "peak_mb": nan, "peak_reserved_mb": nan,
+                         "samples_per_s": nan, "oom": True}
+                    print(f"  {name:<14s} {sh['kind']:<6s} B={sh['b']:<4d} "
+                          f"S={sh['s']:<5d}   OOM during capture (skipped)")
+                results[name][i] = r
+            print()
 
     del model_obj, encoder, batches
     gc.collect()
@@ -361,6 +470,31 @@ def main():
             f"{v} {r['variants'][v]['speedup']:.2f}x" for v in speedup_variants
         )
         print(f"  {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d}  {parts}")
+
+    # The isolated training-graph impact: graph[b] vs its eager-fused[b] baseline
+    # (same kernels, same dense mask — the only difference is capture/replay). This
+    # is the clean A/B the cross-process "graph vs no-graph" runs could never be.
+    graph_variants = [v for v in payload["variants"] if v.startswith("graph[")]
+    if graph_variants:
+        print("\n=== training-graph impact (graph vs eager-fused; speed + peak MB) ===")
+        for r in payload["rows"]:
+            sh = r["shape"]
+            for gv in graph_variants:
+                fv = "fused[" + gv[len("graph["):]
+                g = r["variants"].get(gv)
+                f = r["variants"].get(fv)
+                if g is None or f is None:
+                    continue
+                speed = f["ms"] / g["ms"]
+                # Compare on RESERVED (true footprint). Allocated would credit the
+                # graph with a fake win — its activation pool isn't in that stat.
+                mem = g["peak_reserved_mb"] / f["peak_reserved_mb"]
+                print(
+                    f"  {sh['kind']:<6s} B={sh['b']:<4d} S={sh['s']:<5d}  {gv}: "
+                    f"{speed:.2f}x vs eager-fused, "
+                    f"resv {g['peak_reserved_mb']:.0f} vs {f['peak_reserved_mb']:.0f} MB ({mem:.2f}x); "
+                    f"alloc {g['peak_mb']:.0f} vs {f['peak_mb']:.0f} MB (excludes graph pool)"
+                )
     print(f"\nwrote {json_path}\nwrote {png_path}")
 
 
