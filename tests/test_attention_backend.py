@@ -13,7 +13,11 @@ import torch
 
 from flash_modernbert import ops
 from flash_modernbert.errors import FlashModernBertError
-from flash_modernbert.prepare import _resolve_attention_backend, prepare
+from flash_modernbert.prepare import (
+    _default_backend,
+    _resolve_attention_backend,
+    prepare,
+)
 
 
 def _qkv(s: int):
@@ -69,3 +73,35 @@ def test_resolve_flash_absent(monkeypatch):
 def test_prepare_rejects_unknown_backend():
     with pytest.raises(FlashModernBertError):
         prepare(object(), attention_backend="bogus")
+
+
+def test_flash_min_seq_is_arch_keyed(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    cases = {(12, 0): 128, (10, 0): 512, (9, 0): 1024, (8, 0): 1024}  # last = unknown -> default
+    for cc, expected in cases.items():
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda cc=cc: cc)
+        assert ops._resolve_flash_min_seq() == expected
+
+
+def test_flash_min_seq_falls_back_without_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert ops._resolve_flash_min_seq() == ops._FLASH_MIN_SEQ_DEFAULT == 1024
+
+
+def test_default_backend_prefers_flash_when_available(monkeypatch):
+    # unset default: flash kernel importable -> "auto" (silently)
+    monkeypatch.setattr(ops, "_load_flash_attn", lambda: (None, None, "compiled"))
+    assert _default_backend() == "auto"
+
+
+def test_default_backend_falls_back_to_sdpa(monkeypatch):
+    # unset default: no kernel -> "sdpa", and NO warning (unlike explicit "auto")
+    def boom():
+        raise ImportError("no flash kernel")
+
+    monkeypatch.setattr(ops, "_load_flash_attn", boom)
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning would fail the test
+        assert _default_backend() == "sdpa"

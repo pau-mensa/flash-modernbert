@@ -33,7 +33,7 @@ def prepare(
     cuda_graph: bool | GraphConfig = False,
     train_cuda_graph: bool | TrainGraphConfig = False,
     cuda_graph_seq_cutoff: int = 64,
-    attention_backend: str = "sdpa",
+    attention_backend: str | None = None,
     validate: bool = True,
 ) -> object:
     """Install the fused-tail forward onto `target` and return the same object.
@@ -69,21 +69,34 @@ def prepare(
 
     `attention_backend` selects the attention kernel:
 
-    - `"sdpa"` (default, dependency-free, dense-mask) — wins or ties at short S and
-      is the only path that handles padded batches; the safe universal choice.
+    - **unset (`None`, the default)** — best available: the flash path when a kernel
+      is importable (so flash is the out-of-the-box backend wherever it runs — varlen
+      makes it correct on padded batches too), else the dependency-free `"sdpa"`.
+      Resolves *silently*: an unset backend makes no demand, so a missing kernel is
+      not a warning. The resolved value is recorded in the patch state.
+    - `"sdpa"` — dependency-free, dense-mask; the safe universal choice. Wins or ties
+      at the short-S query regime (flash's fixed cost loses on tiny tensors).
     - `"flash"` — FlashAttention with sliding-window pruning on the local layers
-      (O(S·W) vs O(S²)); the big win at long S. Needs a flash kernel (FA4-cute on
-      sm_90/sm_100, compiled flash-attn on sm_120) and targets unpadded inference.
-    - `"auto"` — the recommended setting when a flash kernel is installed: sdpa
-      below `ops.FLASH_MIN_SEQ` (short-S queries), flash at or above it (long-S
-      docs), decided per call. Falls back to `"sdpa"` if no flash kernel is present,
-      so it stays dependency-optional.
+      (O(S·W) vs O(S²)). On a **padded** batch it unpads and uses the varlen kernel
+      (confines attention within each sequence, skips pad-token compute); on an
+      unpadded batch it runs dense flash. Needs a kernel (FA4-cute on sm_90/sm_100,
+      compiled flash-attn on sm_120).
+    - `"auto"` — sdpa below `ops.FLASH_MIN_SEQ` (short-S queries), flash at or above
+      it (long-S docs), decided per call. Falls back to `"sdpa"` (with a warning,
+      since it was asked for) if no flash kernel is present.
+
+    Measured on padded document batches (5090, ModernBERT-base, bf16), flash beats
+    sdpa from S≈256 up (1.16× → 2.7× at S4096), the win growing with both S and
+    padding fraction (up to 3.25× at ~56% padding) — the varlen path prunes the
+    local layers *and* skips pad-token compute. See `benchmarks/varlen_bench.py`.
 
     `validate` runs the hard gate during prepare.
     """
+    if attention_backend is None:
+        attention_backend = _default_backend()
     if attention_backend not in ("sdpa", "flash", "auto"):
         raise FlashModernBertError(
-            "attention_backend must be 'sdpa', 'flash', or 'auto', got "
+            "attention_backend must be 'sdpa', 'flash', 'auto', or None, got "
             f"{attention_backend!r}"
         )
     encoder = find_encoder(target)
@@ -116,6 +129,17 @@ def prepare(
     setattr(encoder, ATTR, state)
     encoder.forward = _make_forward(encoder, state)
     return target
+
+
+def _default_backend() -> str:
+    """Resolve an unset `attention_backend`: `"auto"` when a flash kernel is
+    importable (flash wherever it can run), else dep-free `"sdpa"`. Silent — an
+    unset backend is not a request, so a missing kernel needs no warning."""
+    try:
+        ops._load_flash_attn()
+        return "auto"
+    except ImportError:
+        return "sdpa"
 
 
 def _resolve_attention_backend(backend: str) -> str:

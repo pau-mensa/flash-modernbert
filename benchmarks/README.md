@@ -232,15 +232,19 @@ Three honest takeaways:
 fused tail competitive there) and whenever peak memory is the constraint. For
 long-S document indexing, the `flash` attention backend below is the bigger lever.
 
-### attention_backend — `sdpa` (default) | `flash` | `auto`
+### attention_backend — `None` (default = best available) | `sdpa` | `flash` | `auto`
 
 The sdpa speedup *shrinks* as S grows because the sliding-window local layers
 (≈2/3 of the model) are expressed as a dense `S×S` mask and run full O(S²).
 `prepare(model, attention_backend="flash")` swaps attention for FlashAttention,
 which takes the window as *structure* (`window_size`) and prunes the local layers
-to the band — O(S·W) — instead of masking. It targets unpadded inference (queries
-with expansion, fixed-length docs); the default `"sdpa"` backend is dependency-free
-and handles padded batches.
+to the band — O(S·W) — instead of masking. On a **padded** batch it unpads to the
+real tokens and uses the varlen kernel (`cu_seqlens` confine attention within each
+sequence, and the whole encoder skips pad-token compute); on an unpadded batch it
+runs dense flash. So flash is now correct on *every* batch shape — which is why the
+**default is `None` = best available**: flash (`"auto"`) when a kernel is importable,
+else dep-free `"sdpa"`, resolved silently. (Before varlen, flash attended across pad
+tokens — cosine 0.32 vs HF — so sdpa had to be the default for padded indexing.)
 
 **Arch-aware kernel.** The flash path picks the right kernel per GPU: CuteDSL
 **FA4** on sm_90 / sm_100 (`pip install flash-attn-4`, the per-arch SOTA — needs
@@ -249,14 +253,19 @@ and handles padded batches.
 flash-attn`, since FA4-cute has no consumer-Blackwell kernel). The package adapts
 the call ABI to whichever loaded.
 
-**`"auto"` is the recommended setting when a flash kernel is installed.** It uses
-sdpa below `ops.FLASH_MIN_SEQ` (1024) and flash at or above it, decided per call —
-so short-S queries take sdpa (where flash is pure fixed-cost overhead and sdpa
-wins/ties on every arch) and long-S docs take flash (where windowed pruning wins).
-The threshold is device-independent: 1024 is at-or-past the measured crossover on
-every arch (≈S512 on B200, ≈S1024 on H200). `"auto"` falls back to `"sdpa"` if no
-flash kernel is present, so it stays dependency-optional. Per-arch FA4-vs-sdpa
-data and the dispatch rationale: `benchmarks/attn_backend_micro.py` /
+**`"auto"` is the dispatch used by the default backend when a flash kernel is
+installed.** It uses sdpa below `ops.FLASH_MIN_SEQ` and flash at or above it, decided
+per call — so short-S queries take sdpa (where flash is pure fixed-cost overhead and
+sdpa wins/ties) and long-S docs take flash (where windowed pruning wins). The
+threshold is **arch-keyed** to each arch's measured crossover — `FLASH_MIN_SEQ` =
+**128 / 512 / 1024** for sm_120 (5090) / sm_100 (B200) / sm_90 (H200), resolved once
+per process from the compute capability (unknown → 1024). It's per-arch because the
+crossover genuinely moves: at S=512, FA *wins* on the 5090 (~1.1×) and B200 (1.55×)
+but *loses* on H200 (0.64× — strong cuDNN sdpa + high FA4 floor). A single global
+1024 was really an H200-safe number that left the 5090's S128–1024 and B200's S256–512
+wins on the table. `"auto"` falls back to `"sdpa"` if no flash kernel is present, so it
+stays dependency-optional. Per-arch FA4-vs-sdpa data and the dispatch rationale:
+`benchmarks/attn_backend_micro.py` /
 `docs/roadmap.md` Workstream D.
 
 Backend comparison (5090, ModernBERT-base, bf16), speedup vs stock HF, run via
@@ -292,7 +301,33 @@ compute dominates so it was already negligible.
 
 Correctness: the flash forward matches stock HF at cosine 0.9995 (tighter than
 sdpa's 0.99918). Measured on a torch-2.8 env with the prebuilt FA 2.8.3 wheel
-(runs on sm_120 from PTX — no toolkit build).
+(runs on sm_120 from PTX — no toolkit build). Install it via the `flash` extra:
+`uv sync --extra flash` (pins torch 2.8 + the wheel; the dep-free `sdpa` default
+needs neither). On sm_90/sm_100 use `pip install flash-attn-4` instead.
+
+#### varlen — padded, variable-length doc batches (`varlen_bench.py`)
+
+The tables above are all-ones (unpadded) batches. A real indexing batch pads
+documents of different lengths to the batch max, and there flash unpads to the real
+tokens and runs the **varlen** kernel. `varlen_bench.py` measures that head-to-head
+(5090, ModernBERT-base, bf16, B16); flash beats sdpa across the whole range, the win
+growing with S and with padding:
+
+| S (≈75% real) | flash/sdpa | flash/stock | | S=2048 padding | flash/sdpa |
+| --- | --- | --- | --- | --- | --- |
+| 256  | 1.16× | 1.59× | | none (0%)  | 1.42× |
+| 512  | 1.45× | 1.91× | | ~12%       | 1.78× |
+| 1024 | 1.60× | 2.31× | | ~28%       | 2.13× |
+| 2048 | 1.93× | 2.72× | | ~56%       | 3.25× |
+| 4096 | 2.71× | 3.51× | |            |       |
+
+Flash wins padded batches from **S≈256** (vs ~S128 unpadded on this arch) because
+varlen wins twice over sdpa's dense `S×S`: local-layer O(S²)→O(S·W) pruning **and**
+skipping all pad-token compute (GEMMs/LN/GeGLU run on real tokens only). Reserved
+memory is equal-or-lower than sdpa. On padded batches flash went from **cosine 0.32 →
+0.9998** vs stock HF (which unpads + varlen-flashes itself), validated in
+`tests/test_varlen.py`. The varlen path is eager-only (graphs stay the short-S sdpa
+feature). `uv run benchmarks/varlen_bench.py`.
 
 Configs: `inference_short.yml` (classic ColBERT Q≈32 / D≈300 — also the roadmap's
 C3 short-S config) and `inference_indexing.yml` (long documents). Both take a

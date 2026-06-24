@@ -238,28 +238,66 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
     return out.reshape(b, s, -1)
 
 
-# Cross-arch-safe sequence-length threshold for the "auto" backend: use flash only
-# once S is comfortably past the sliding window, where the local layers actually
-# prune (O(S·W) < O(S²)) by enough to clear FlashAttention's fixed-cost floor. The
-# measured encoder-attention crossover is ~S512 on B200 (sm_100) and ~S1024 on H200
-# (sm_90), so below 1024 sdpa is parity-or-better on every arch and above it flash
-# wins — one device-independent line (see docs/roadmap.md Workstream D).
-FLASH_MIN_SEQ = 1024
+# Sequence-length threshold for the "auto" backend: at/above it flash beats sdpa,
+# below it flash's fixed-cost floor loses (the local layers can't prune enough yet).
+# The crossover is **arch-dependent**, so this is keyed on compute capability rather
+# than one global line — a single constant either regresses an arch below its
+# crossover or leaves wins on the table. Measured encoder-attention crossovers
+# (benchmarks/attn_backend_micro.py, synthesized over 8 global + 14 local layers;
+# the crossover point is backend-difference = attention only, so it carries to the
+# full forward):
+#
+#   sm_120 (5090, compiled FA2): ~S128  — flash ties by S256, wins by S512.
+#   sm_100 (B200, cute FA4):     ~S512  — flash wins at 512 (1.55×), loses at 256 (0.75×).
+#   sm_90  (H200, cute FA4):     ~S1024 — sdpa still wins at 512 (flash 0.64×), flash wins at 1024 (1.68×).
+#
+# Unknown arch / no CUDA falls back to 1024 (the safe-everywhere line — flash wins
+# above it on every measured arch). See docs/roadmap.md Workstream D.
+_FLASH_MIN_SEQ_BY_CC = {
+    (12, 0): 128,   # sm_120 — consumer Blackwell (5090)
+    (10, 0): 512,   # sm_100 — datacenter Blackwell (B200)
+    (9, 0): 1024,   # sm_90  — Hopper (H200): strong cuDNN sdpa + high FA4 floor
+}
+_FLASH_MIN_SEQ_DEFAULT = 1024
 
 
-_flash_attn = None  # cached (func, kind) where kind in {"cute", "compiled"}
+def _resolve_flash_min_seq() -> int:
+    """The per-GPU `"auto"` flash threshold (see `_FLASH_MIN_SEQ_BY_CC`). Guarded so
+    a CPU-only import (e.g. the pure-logic tests) gets the safe 1024 fallback rather
+    than touching CUDA."""
+    try:
+        if not torch.cuda.is_available():
+            return _FLASH_MIN_SEQ_DEFAULT
+        cc = torch.cuda.get_device_capability()
+    except Exception:  # pragma: no cover - defensive: no/duff CUDA
+        return _FLASH_MIN_SEQ_DEFAULT
+    return _FLASH_MIN_SEQ_BY_CC.get(cc, _FLASH_MIN_SEQ_DEFAULT)
+
+
+# Resolved once for this process's GPU (the device is fixed per process). Read by
+# both dispatch sites (`attention` here, `forward._resolve_eager_backend`).
+FLASH_MIN_SEQ = _resolve_flash_min_seq()
+
+
+_flash_attn = None  # cached (func, varlen_func, kind) where kind in {"cute", "compiled"}
 
 
 def _import_cute_flash():
-    from flash_attn.cute import flash_attn_func  # CuteDSL FA4 (sm_90/100/110)
+    from flash_attn.cute import (  # CuteDSL FA4 (sm_90/100/110)
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
 
-    return flash_attn_func, "cute"
+    return flash_attn_func, flash_attn_varlen_func, "cute"
 
 
 def _import_compiled_flash():
-    from flash_attn import flash_attn_func  # compiled FA2/FA3 (incl. sm_120 / PTX)
+    from flash_attn import (  # compiled FA2/FA3 (incl. sm_120 / PTX)
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
 
-    return flash_attn_func, "compiled"
+    return flash_attn_func, flash_attn_varlen_func, "compiled"
 
 
 def _load_flash_attn():
@@ -272,8 +310,9 @@ def _load_flash_attn():
       **compiled** flash-attn FA2 path (`pip install flash-attn`, runs from PTX).
 
     Tries the arch-appropriate kernel first, then the other, and raises only if
-    neither imports. Returns `(func, kind)`; `kind` selects the call ABI in
-    `flash_attention` (the cute and compiled `flash_attn_func` differ)."""
+    neither imports. Returns `(func, varlen_func, kind)`; `kind` selects the call
+    ABI (the cute and compiled funcs differ); `varlen_func` is the packed
+    padded-batch entry point (`flash_attention_varlen`)."""
     global _flash_attn
     if _flash_attn is not None:
         return _flash_attn
@@ -317,7 +356,7 @@ def flash_attention(q, k, v, window, scaling):
     spells it `(None, None)`, and returns `(out, lse)`. `_load_flash_attn` reports
     which kind loaded, and we adapt the call accordingly.
     """
-    func, kind = _load_flash_attn()
+    func, _varlen, kind = _load_flash_attn()
     qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     if kind == "cute":
         w = (None, None) if window == (-1, -1) else window
@@ -333,9 +372,58 @@ def flash_attention(q, k, v, window, scaling):
     return out.reshape(b, s, -1)
 
 
-def attention(q, k, v, *, mask, window, scaling, backend):
+def flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling):
+    """FlashAttention over a **packed, variable-length** batch — the path for
+    padded document batches (different lengths padded to a common `S`).
+
+    The encoder runs the whole forward as a single `b=1` sequence of `total`
+    concatenated real tokens (padding already stripped, see `forward._unpad`), so
+    q/k/v arrive as the `[1, H, total, D]` transpose views the rest of the tail
+    uses. `flash_attn_varlen_func` wants `[total, H, D]` plus `cu_seqlens` (the
+    per-sequence boundaries) so it confines attention to within each sequence — no
+    cross-document leakage, and no `S×S` mask. `.squeeze(0).transpose(0, 1)` is a
+    free view; FA only needs the head dim (last) contiguous, which holds.
+
+    `window` is the same per-layer structure as the dense path: `(-1, -1)` full
+    (global layers), `(half, half)` the symmetric sliding band (local layers).
+    Under varlen the band is measured *within* each sequence (FA aligns it to
+    each sub-sequence's own positions), exactly the local-attention semantics.
+
+    Returns `[1, total, hidden]` to match the dense attention's `[b, s, hidden]`
+    so the surrounding layer code (residual add, Wo) is identical."""
+    _dense, func, kind = _load_flash_attn()
+    qt = q.squeeze(0).transpose(0, 1)  # [1,H,total,D] -> [total,H,D] (view)
+    kt = k.squeeze(0).transpose(0, 1)
+    vt = v.squeeze(0).transpose(0, 1)
+    if kind == "cute":
+        w = (None, None) if window == (-1, -1) else window
+        out = func(
+            qt, kt, vt,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            softmax_scale=scaling, causal=False, window_size=w,
+        )
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+    else:
+        out = func(
+            qt, kt, vt,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            dropout_p=0.0, softmax_scale=scaling, causal=False, window_size=window,
+        )
+    total = out.shape[0]
+    return out.reshape(1, total, -1)
+
+
+def attention(q, k, v, *, mask, window, scaling, backend, cu_seqlens=None, max_seqlen=None):
     """Dispatch attention to the selected backend. `mask` feeds sdpa; `window`
     feeds flash; both are precomputed per layer so this stays a thin switch.
+
+    When `cu_seqlens` is supplied (the packed varlen path, decided once at the
+    forward level — see `forward._varlen_forward`), the flash backend routes to
+    `flash_attention_varlen`; the dense flash/sdpa kernels are for the
+    rectangular `[B, S]` path.
 
     `"auto"` resolves per call from `q`'s sequence length: flash for `S >=
     FLASH_MIN_SEQ` (long-S docs, where windowed pruning wins on every arch) and
@@ -347,5 +435,7 @@ def attention(q, k, v, *, mask, window, scaling, backend):
     if backend == "auto":
         backend = "flash" if q.shape[2] >= FLASH_MIN_SEQ else "sdpa"
     if backend == "flash":
+        if cu_seqlens is not None:
+            return flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling)
         return flash_attention(q, k, v, window, scaling)
     return sdpa_attention(q, k, v, mask, scaling)

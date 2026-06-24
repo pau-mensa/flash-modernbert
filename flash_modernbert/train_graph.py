@@ -244,13 +244,20 @@ class _TrainGraphRunner:
         # capture. It doesn't here — our path differentiates with `autograd.grad`
         # and accumulates explicitly, never running those AccumulateGrad nodes — so
         # silence the false alarm just around capture, restoring the user's setting.
-        warn_mismatch = torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch
-        warn_mismatch(False)
+        # `set_warn_on_accumulate_grad_stream_mismatch` is a torch 2.11+ toggle;
+        # on the pinned torch 2.8 (the flash-backend ABI floor) neither the warning
+        # nor its toggle exist, so there is nothing to silence — skip it.
+        warn_mismatch = getattr(
+            torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch", None
+        )
+        if warn_mismatch is not None:
+            warn_mismatch(False)
         try:
             with torch.autograd.set_multithreading_enabled(False):
                 return self._capture_inner(b, s)
         finally:
-            warn_mismatch(True)
+            if warn_mismatch is not None:
+                warn_mismatch(True)
 
     def _capture_inner(self, b: int, s: int) -> _Captured:
         static = _StaticInputs(

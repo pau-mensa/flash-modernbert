@@ -179,6 +179,8 @@ def _encoder_layer(
     mask: Tensor | None,
     window: tuple[int, int],
     backend: str,
+    cu_seqlens: Tensor | None = None,
+    max_seqlen: int | None = None,
 ) -> Tensor:
     b, s = x.shape[:2]
     h, d = params.num_attention_heads, params.head_dim
@@ -193,7 +195,10 @@ def _encoder_layer(
     q, k, v = qkv.unbind(dim=2)
     q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     q, k = ops.fused_apply_rope(q, k, cos, sin)
-    ctx = ops.attention(q, k, v, mask=mask, window=window, scaling=params.scaling, backend=backend)
+    ctx = ops.attention(
+        q, k, v, mask=mask, window=window, scaling=params.scaling, backend=backend,
+        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+    )
     x = x + F.linear(ctx, layer.attn.Wo.weight, None)
 
     mlp_norm = layer.mlp_norm
@@ -215,12 +220,17 @@ def core(
     sliding_mask: Tensor,
     *,
     backend: str = "sdpa",
+    cu_seqlens: Tensor | None = None,
+    max_seqlen: int | None = None,
 ) -> Tensor:
     """Encoder-layer loop + final norm. The capturable region.
 
     Each layer gets both the dense mask (for the sdpa backend) and its attention
     *window* (for the flash backend): global layers attend fully `(-1, -1)`, local
-    layers over the sliding band `(±sliding_half_window)`."""
+    layers over the sliding band `(±sliding_half_window)`.
+
+    `cu_seqlens`/`max_seqlen` (the packed varlen path) are threaded straight to the
+    flash backend; they leave the layer math otherwise untouched (masks unused)."""
     half = params.sliding_half_window
     global_window = (-1, -1)
     local_window = (half, half)
@@ -229,9 +239,97 @@ def core(
             cos, sin, mask, window = cos_global, sin_global, full_mask, global_window
         else:
             cos, sin, mask, window = cos_local, sin_local, sliding_mask, local_window
-        x = _encoder_layer(x, layer, params, cos, sin, mask, window, backend)
+        x = _encoder_layer(
+            x, layer, params, cos, sin, mask, window, backend,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+        )
     final_norm = model.final_norm
     return ops.fused_layer_norm(x, final_norm.weight, final_norm.eps)
+
+
+# ---------------------------------------------------------------------------
+# Varlen (packed, variable-length) path — the generally-usable flash backend
+# ---------------------------------------------------------------------------
+
+
+def _has_padding(attention_mask: Tensor | None) -> bool:
+    """True when the batch is padded (some `attention_mask` entry is 0). Carries a
+    host sync (`.all()`), which is fine on the eager varlen path (never captured)."""
+    return attention_mask is not None and not bool((attention_mask == 1).all())
+
+
+def _resolve_eager_backend(backend: str, seq_len: int) -> str:
+    """Resolve `"auto"` to a concrete backend for the eager forward, using the same
+    `FLASH_MIN_SEQ` rule the per-call `ops.attention` switch uses — flash for long
+    S, sdpa for short. `"flash"`/`"sdpa"` pass through. Done once at the forward
+    level so the padded-batch decision (varlen vs dense) is made before the loop."""
+    if backend == "auto":
+        return "flash" if seq_len >= ops.FLASH_MIN_SEQ else "sdpa"
+    return backend
+
+
+def _unpad(
+    x: Tensor, attention_mask: Tensor
+) -> tuple[Tensor, Tensor, Tensor, int, Tensor]:
+    """Strip padding from `x` [B, S, H] using `attention_mask` [B, S] (1 = real).
+
+    Returns the packed real tokens and everything `flash_attn_varlen_func` needs:
+    - `x_packed` [total, H] — real tokens, sequences concatenated in row order.
+    - `indices` [total] — flat positions into `[B*S]`, for re-padding the output.
+    - `cu_seqlens` [B+1] int32 — cumulative per-sequence lengths (the boundaries).
+    - `max_seqlen` int — longest real sequence (FA's tile bound).
+    - `position_ids` [total] — each token's column index `= indices % S`, i.e. its
+      absolute position in the padded row. This matches stock ModernBERT, which
+      assigns RoPE positions by `arange(S)` regardless of padding side, so the
+      per-token RoPE gather `cos_table[position_ids]` reproduces HF exactly.
+    """
+    b, s = attention_mask.shape
+    hidden = x.shape[-1]
+    seqlens = attention_mask.sum(dim=1, dtype=torch.int32)            # [B]
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    cu_seqlens = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))  # [B+1]
+    max_seqlen = int(seqlens.max())
+    x_packed = x.reshape(b * s, hidden).index_select(0, indices)     # [total, H]
+    position_ids = indices % s                                       # [total]
+    return x_packed, indices, cu_seqlens, max_seqlen, position_ids
+
+
+def _repad(x_packed: Tensor, indices: Tensor, b: int, s: int) -> Tensor:
+    """Scatter packed tokens [total, H] back into a padded [B, S, H] tensor (pad
+    rows left zero — the inverse of `_unpad`'s `index_select`)."""
+    hidden = x_packed.shape[-1]
+    out = x_packed.new_zeros(b * s, hidden)
+    out.index_copy_(0, indices, x_packed)
+    return out.reshape(b, s, hidden)
+
+
+def _varlen_forward(
+    model: nn.Module,
+    params: ModernBertParams,
+    p: _Prologue,
+    input_ids: Tensor,
+    attention_mask: Tensor,
+) -> Tensor:
+    """Run the whole encoder on the unpadded (packed) batch, then re-pad.
+
+    The packed batch is a single `b=1` sequence of `total` real tokens, so `core`
+    and `_encoder_layer` run unchanged — only attention takes `cu_seqlens` (varlen
+    flash, which confines attention within each original sequence) and RoPE takes
+    per-token-gathered cos/sin. GEMMs / LayerNorm / GeGLU therefore touch only real
+    tokens (no wasted pad-token compute — the ModernBERT efficiency win)."""
+    b, s = input_ids.shape
+    x_packed, indices, cu_seqlens, max_seqlen, position_ids = _unpad(p.x, attention_mask)
+    cos_g = p.cos_global[0].index_select(0, position_ids)
+    sin_g = p.sin_global[0].index_select(0, position_ids)
+    cos_l = p.cos_local[0].index_select(0, position_ids)
+    sin_l = p.sin_local[0].index_select(0, position_ids)
+    out = core(
+        model, params,
+        x_packed.unsqueeze(0), cos_g, sin_g, cos_l, sin_l,
+        None, None,
+        backend="flash", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+    )
+    return _repad(out.squeeze(0), indices, b, s)
 
 
 def fused_forward(
@@ -242,11 +340,19 @@ def fused_forward(
     *,
     backend: str = "sdpa",
 ) -> Tensor:
-    """Eager fused-tail forward — returns the final-normed hidden state."""
+    """Eager fused-tail forward — returns the final-normed hidden state.
+
+    On a **padded** batch with the flash backend, routes through the packed varlen
+    path (correct per-sequence masking + no pad-token compute). Otherwise runs the
+    rectangular `[B, S]` path: dense flash on an unpadded batch, or sdpa (which
+    handles padding via its additive mask) — both numerically as before."""
     p = prologue(model, params, input_ids, attention_mask)
+    resolved = _resolve_eager_backend(backend, input_ids.shape[1])
+    if resolved == "flash" and _has_padding(attention_mask):
+        return _varlen_forward(model, params, p, input_ids, attention_mask)
     return core(
         model, params,
         p.x, p.cos_global, p.sin_global, p.cos_local, p.sin_local,
         p.full_mask, p.sliding_mask,
-        backend=backend,
+        backend=resolved,
     )

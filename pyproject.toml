@@ -6,7 +6,13 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = { file = "LICENSE" }
 dependencies = [
-    "torch>=2.7",
+    # Pinned to the 2.8 series: the FlashAttention backend (sm_120 / consumer
+    # Blackwell) uses the prebuilt compiled flash-attn wheel, which Dao-AILab
+    # only publishes per torch minor (newest is torch2.9) and which is ABI-locked
+    # to the torch it was built against (torch 2.10+ bumped the c10 ABI). 2.8 is
+    # the version the flash + fused-tail paths are measured against on the 5090.
+    # The default 'sdpa' backend itself works on any torch>=2.7.
+    "torch>=2.8,<2.9",
     "transformers>=4.45",
     "nvidia-cutlass-dsl>=4.5.2",
     "numpy",
@@ -16,6 +22,11 @@ dependencies = [
 # Frameworks the package patches. Installed by consumers, not required to import.
 sentence-transformers = ["sentence-transformers>=3.0"]
 pylate = ["pylate>=1.5"]
+# FlashAttention backend (optional — the default 'sdpa' backend needs none).
+# This wheel is the COMPILED flash-attn FA2 for consumer Blackwell (sm_120),
+# matched to torch 2.8 / cp311. On sm_90 / sm_100 use cute FA4 instead
+# (`pip install flash-attn-4`), which this package's loader auto-selects there.
+flash = ["flash-attn"]
 
 [build-system]
 requires = ["hatchling"]
@@ -31,6 +42,9 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+# Prebuilt compiled flash-attn FA2 for sm_120, matched to torch 2.8 / cp311 / cu12.
+# (There is no PyPI wheel that fits this torch; this is the Dao-AILab release asset.)
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" }
 
 [dependency-groups]
 dev = [
