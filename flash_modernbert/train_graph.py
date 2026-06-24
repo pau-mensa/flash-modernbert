@@ -77,9 +77,20 @@ class TrainGraphConfig:
     batches produce one graph per distinct shape, bounded by `max_graphs` (LRU);
     the eager fused tail already wins at long S, so doc-side churn just falls back
     to eager via the cap. A shape larger than `max_tokens` is never captured.
+
+    **Memory cost scales with `max_graphs`.** Every captured bucket pins its *own*
+    full activation pool for the runner's lifetime (the backward graph retains the
+    forward's saved tensors), so N live graphs hold N activation sets at once —
+    unlike the eager path, which reuses one chunk's peak. Measured on the realistic
+    GradCache loop, the graphed run's true (reserved) footprint is ~1.2× the eager
+    path's, *because* it pins the query-pool and doc-pool simultaneously. Training
+    graphs are a short-S **latency** win, not a memory win; keep `max_graphs` small
+    (the default covers a query bucket plus a few doc buckets). The earlier "graphs
+    halve VRAM" reading was an artifact of `max_memory_allocated`, which does not
+    count a graph's private pool — measure with `max_memory_reserved`.
     """
 
-    max_graphs: int = 16
+    max_graphs: int = 4
     max_tokens: int = 2 ** 20
     warmup: int = 3
 
@@ -121,11 +132,21 @@ class _TrainGraphFn(torch.autograd.Function):
         captured.fwd_graph.replay()
         ctx.captured = captured
         ctx.num_params = len(params)
-        return captured.out
+        # Clone the static output: `captured.out` is a fixed buffer the fwd graph
+        # overwrites on every replay, so handing it back raw aliases across calls —
+        # a second forward of this bucket (before this one's backward) would corrupt
+        # it. The clone (a plain copy here, since Function.forward runs grad-off)
+        # gives each call its own output and hands autograd a history-free tensor to
+        # hang our grad_fn on, instead of one still carrying the capture-time graph.
+        # Backward is unaffected: the clone is identity, so grad_output still arrives
+        # as the gradient w.r.t. `captured.out`.
+        return captured.out.clone()
 
     @staticmethod
     def backward(ctx, grad_output):
         captured = ctx.captured
+        if grad_output is None:  # output unused downstream — nothing to backprop
+            return (None, None, None, None, None) + (None,) * ctx.num_params
         captured.grad_out.copy_(grad_output)
         captured.bwd_graph.replay()
         return (None, None, None, None, None) + (None,) * ctx.num_params
@@ -240,7 +261,12 @@ class _TrainGraphRunner:
         autocast). With the cache *off*, the bf16 weight casts are recomputed
         inline and so are *recorded into the graph*, reading the persistent fp32
         master each replay. When autocast is off (plain bf16 weights), this is a
-        no-op and the kernels run directly."""
+        no-op and the kernels run directly.
+
+        The autocast state is baked in at capture: a bucket captured under autocast
+        records the casts, one captured without does not. Replaying under a
+        *different* autocast regime than capture would be stale — fine in practice
+        (autocast config is fixed across a run), but an assumption, not enforced."""
         if not torch.is_autocast_enabled("cuda"):
             return contextlib.nullcontext()
         return torch.autocast(
@@ -285,9 +311,7 @@ class _TrainGraphRunner:
         # `.grad` is *not* zeroed here: warmup goes through `autograd.grad`, which
         # never writes `.grad`, so the primed zeros are still intact — and a
         # pending in-place `zero_()` on the default stream at this point would make
-        # the capture stream depend on it ("legacy stream" error). The post-capture
-        # `_zero_grads()` (after a sync) clears the single accumulation the capture
-        # itself recorded, so the first real step starts from clean grads.
+        # the capture stream depend on it ("legacy stream" error).
         bwd_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(bwd_graph, pool=pool):
             grads = torch.autograd.grad(
@@ -298,7 +322,10 @@ class _TrainGraphRunner:
                 if g is not None:
                     p.grad.add_(g)
 
-        # Clear the warmup/capture pollution so the first real step starts clean.
+        # Defensive re-zero. Graph *capture* records the `add_` without executing
+        # it, and warmup used `autograd.grad` (which never touches `.grad`), so the
+        # primed zeros should already be intact — this just guarantees the first
+        # real step starts from clean grads regardless.
         self._zero_grads()
         return _Captured(fwd_graph, bwd_graph, static, out, grad_out)
 
