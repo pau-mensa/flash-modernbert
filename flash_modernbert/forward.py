@@ -143,7 +143,9 @@ def prologue(
 # ---------------------------------------------------------------------------
 
 
-def _layer_is_global(layer: nn.Module, layer_idx: int, params: ModernBertParams) -> bool:
+def _layer_is_global(
+    layer: nn.Module, layer_idx: int, params: ModernBertParams
+) -> bool:
     attention_type = getattr(layer, "attention_type", None)
     if attention_type == "full_attention":
         return True
@@ -178,8 +180,15 @@ def _encoder_layer(
     q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     q, k = ops.fused_apply_rope(q, k, cos, sin)
     ctx = ops.attention(
-        q, k, v, mask=mask, window=window, scaling=params.scaling, backend=backend,
-        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+        q,
+        k,
+        v,
+        mask=mask,
+        window=window,
+        scaling=params.scaling,
+        backend=backend,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
     )
     x = x + F.linear(ctx, layer.attn.Wo.weight, None)
 
@@ -219,8 +228,16 @@ def core(
         else:
             cos, sin, mask, window = cos_local, sin_local, sliding_mask, local_window
         x = _encoder_layer(
-            x, layer, params, cos, sin, mask, window, backend,
-            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            x,
+            layer,
+            params,
+            cos,
+            sin,
+            mask,
+            window,
+            backend,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
     final_norm = model.final_norm
     return ops.fused_layer_norm(x, final_norm.weight, final_norm.eps)
@@ -278,25 +295,55 @@ def _repad(x_packed: Tensor, indices: Tensor, b: int, s: int) -> Tensor:
 def _varlen_forward(
     model: nn.Module,
     params: ModernBertParams,
-    p: _Prologue,
     input_ids: Tensor,
     attention_mask: Tensor,
 ) -> Tensor:
     """Run the encoder on the packed (unpadded) batch as a single `b=1` sequence,
     then re-pad. `core` runs unchanged — only attention takes `cu_seqlens` (confining
-    it within each original sequence) and RoPE takes per-token-gathered cos/sin. No
-    pad-token compute touches the GEMMs/LayerNorm/GeGLU — the ModernBERT win."""
+    it within each original sequence) and RoPE takes per-token-gathered cos/sin."""
     b, s = input_ids.shape
-    x_packed, indices, cu_seqlens, max_seqlen, position_ids = _unpad(p.x, attention_mask)
-    cos_g = p.cos_global[0].index_select(0, position_ids)
-    sin_g = p.sin_global[0].index_select(0, position_ids)
-    cos_l = p.cos_local[0].index_select(0, position_ids)
-    sin_l = p.sin_local[0].index_select(0, position_ids)
+    device = input_ids.device
+    # Unpad ids first (treat [B, S] as [B, S, 1] so _unpad's index math is reused).
+    packed_ids, indices, cu_seqlens, max_seqlen, position_ids = _unpad(
+        input_ids.unsqueeze(-1), attention_mask
+    )
+    packed_ids = packed_ids.squeeze(-1)
+
+    # Embed only the real tokens.
+    emb = model.embeddings.tok_embeddings(packed_ids)
+    norm = model.embeddings.norm
+    x_packed = ops.fused_layer_norm(emb, norm.weight, norm.eps)
+    dtype = x_packed.dtype
+
+    # RoPE tables up to the longest real sequence only (position_ids < max_seqlen),
+    # then gather per token — same values as the full [0, S) table the dense path uses.
+    head_dim = params.head_dim
+    cos_g, sin_g = _rope_tables(
+        max_seqlen, head_dim, params.global_rope_theta, device, dtype
+    )
+    if params.local_rope_theta == params.global_rope_theta:
+        cos_l, sin_l = cos_g, sin_g
+    else:
+        cos_l, sin_l = _rope_tables(
+            max_seqlen, head_dim, params.local_rope_theta, device, dtype
+        )
+
+    def gather(t: Tensor) -> Tensor:
+        return t[0].index_select(0, position_ids)
+
     out = core(
-        model, params,
-        x_packed.unsqueeze(0), cos_g, sin_g, cos_l, sin_l,
-        None, None,
-        backend="flash", cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+        model,
+        params,
+        x_packed.unsqueeze(0),
+        gather(cos_g),
+        gather(sin_g),
+        gather(cos_l),
+        gather(sin_l),
+        None,
+        None,
+        backend="flash",
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
     )
     return _repad(out.squeeze(0), indices, b, s)
 
@@ -313,13 +360,19 @@ def fused_forward(
 
     A padded batch with the flash backend routes through the packed varlen path;
     otherwise the rectangular `[B, S]` path (dense flash on unpadded, or sdpa)."""
-    p = prologue(model, params, input_ids, attention_mask)
     resolved = _resolve_eager_backend(backend, input_ids.shape[1])
     if resolved == "flash" and _has_padding(attention_mask):
-        return _varlen_forward(model, params, p, input_ids, attention_mask)
+        return _varlen_forward(model, params, input_ids, attention_mask)
+    p = prologue(model, params, input_ids, attention_mask)
     return core(
-        model, params,
-        p.x, p.cos_global, p.sin_global, p.cos_local, p.sin_local,
-        p.full_mask, p.sliding_mask,
+        model,
+        params,
+        p.x,
+        p.cos_global,
+        p.sin_global,
+        p.cos_local,
+        p.sin_local,
+        p.full_mask,
+        p.sliding_mask,
         backend=resolved,
     )
