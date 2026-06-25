@@ -18,18 +18,41 @@ sm_120) and error otherwise.
 
 ## pylate_trainer.py — the real recipe, only `prepare()` differs
 
-Ordinary PyLate boilerplate — `models.ColBERT`, `losses.CachedContrastive`, the
-`ColBERTCollator`, and the actual `SentenceTransformerTrainer` (which runs on
+Ordinary boilerplate around the actual `SentenceTransformerTrainer` (which runs on
 accelerate). The **only** difference between the two runs is one line:
 
 ```python
-model = build_colbert(cfg)
+model = build_model(cfg)                              # framework object (see below)
 if fused:
     fm.prepare(model, cuda_graph=cfg["cuda_graph"])   # <-- the entire difference
 trainer = SentenceTransformerTrainer(model=model, args=args, train_dataset=ds,
                                      loss=loss, data_collator=collator, callbacks=[metrics])
 trainer.train()
 ```
+
+**`model.framework` selects the framework — C2, framework transparency.** Both
+options below subclass `SentenceTransformer`, so both drive the same trainer, and
+`prepare()` locates and patches the wrapped `ModernBertModel` either way — proving
+Decision-1 (the in-place monkeypatch) is transparent across frameworks with zero
+per-framework adapter code:
+
+| `model.framework` | model | loss | collator | config |
+| --- | --- | --- | --- | --- |
+| `pylate` (default) | `models.ColBERT` | `CachedContrastive` (GradCache) | `ColBERTCollator` | `msmarco_trainer.yml` |
+| `sentence_transformers` | `SentenceTransformer` (mean-pool bi-encoder) | `CachedMultipleNegativesRankingLoss` | trainer default | `st_trainer.yml` |
+
+```bash
+uv run benchmarks/pylate_trainer.py benchmarks/configs/msmarco_trainer.yml  # pylate
+uv run benchmarks/pylate_trainer.py benchmarks/configs/st_trainer.yml       # sentence_transformers
+```
+
+Measured ST bi-encoder (5090, ModernBERT-base, synthetic triplets, B16, S≈512, 60
+steps, `bf16=True`): the same one-line `prepare()` gives **1.21×/step and 1.00 GB
+peak VRAM saved** (0.87×), losses tracking — the fused win carries across frameworks
+unchanged. (Raw HF `AutoModel` training transparency is `train_bench.py` — an
+AutoModel can't drive the SentenceTransformerTrainer; inference transparency across
+all three frameworks is `inference_bench.py`'s `framework` knob + the
+`encode_transparency.py` smoke, all PASS.)
 
 A `TrainerCallback` records per-step loss / step time / peak VRAM from inside the
 real loop. Run it:
@@ -176,6 +199,47 @@ cuda_graph: false
 optimizer: { lr: 3.0e-5 }
 output: { dir: benchmarks/results, name: my_run }
 ```
+
+## max_batch_bench.py — C1 max-batch / OOM frontier
+
+The iso-batch benchmarks above measure the fused tail's memory saving *at a fixed
+batch*; this one states the headline directly: **the largest fwd+bwd batch each
+variant fits before it OOMs**, at a fixed sequence length. The eager fused tail's
+in-place backward (in-place LayerNorm-bwd, fused GeGLU+Wo-bwd) drops the saved-
+activation set HF's autograd retains, and that saving scales with the token count
+B·S — so it is widest exactly at the frontier, cashed out as extra batch capacity.
+
+```bash
+uv run benchmarks/max_batch_bench.py benchmarks/configs/max_batch.yml
+```
+
+Measured on **reserved** memory (what actually decides OOM, not allocated; the unit
+is the bare encoder fwd+bwd with no optimizer state — the clean kernel A/B, an
+exponential ramp then a binary search per variant). RTX 5090 (sm_120, 32 GB), bf16:
+
+| S | stock | fused[sdpa] | fused[flash] |
+| --- | --- | --- | --- |
+| 512  | 105 | **116 (1.10×)** — 344 ms | 111 (1.06×) — 293 ms |
+| 2048 | 24  | **28 (1.17×)** — 519 ms  | 27 (1.12×) — **321 ms** |
+
+Two honest reads:
+
+- **The eager fused tail trains a batch stock OOMs on** — 116 vs 105 at S=512, 28 vs
+  24 at S=2048 — at the same ~31 GB reserved ceiling, so the extra samples are the
+  smaller per-sample activation set. The headroom **widens with S** (1.10× → 1.17×):
+  more tokens per backward ⇒ more saved-activation reduction. A real training step
+  adds a fixed optimizer-state overhead (variant-invariant), lowering every frontier
+  equally without changing the gap.
+- **`flash` trades a hair of frontier for latency.** It fits ~1 batch fewer than sdpa
+  (the dense-flash path's workspace), but is much faster at long S (321 ms vs 519 ms
+  at S=2048) — flash is the long-S *latency* lever (Workstream D), sdpa is marginally
+  the more batch-dense one. `include_graph: true` adds the training-graph frontier; it
+  OOMs *lower* (each captured shape pins its own activation pool — graphs cost more
+  reserved, never less; see the roadmap's Workstream B).
+
+The flash variant needs a kernel; the config's PEP-723 header pins the compiled
+flash-attn wheel for sm_120, and `attention_backends: [sdpa, flash]` selects which
+frontiers to search (drop `flash` on a kernel-free box).
 
 ## inference_bench.py — encoder forward: stock vs fused vs graphed
 

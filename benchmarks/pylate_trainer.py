@@ -11,25 +11,41 @@
 # url = "https://download.pytorch.org/whl/cu128"
 # explicit = true
 # ///
-"""Native PyLate training recipe, run stock vs flash-modernbert.
+"""Native SentenceTransformerTrainer recipe, run stock vs flash-modernbert.
 
-This is an ordinary PyLate training boilerplate — `models.ColBERT`,
-`losses.CachedContrastive`, the `ColBERTCollator`, and the real
-`SentenceTransformerTrainer` (which runs on accelerate). It runs that exact
-recipe twice from an identical weight init on identical data, and **the only
-line that differs between the two runs is `flash_modernbert.prepare(model)`**:
+Ordinary training boilerplate around the real `SentenceTransformerTrainer` (which
+runs on accelerate). It runs the exact recipe twice from an identical weight init
+on identical data, and **the only line that differs between the two runs is
+`flash_modernbert.prepare(model)`**:
 
-    model = build_colbert(cfg)
+    model = build_model(cfg)               # PyLate ColBERT or a SentenceTransformer
     if fused:
-        fm.prepare(model, cuda_graph=...)   # <-- the entire difference
+        fm.prepare(model, cuda_graph=...)  # <-- the entire difference
     trainer = SentenceTransformerTrainer(model=model, args=args, ...)
     trainer.train()
+
+`model.framework` (C2 — framework transparency) selects which framework object the
+recipe is built on, proving Decision-1 (the in-place monkeypatch) is transparent
+across frameworks — the same one-line `prepare()` accelerates each with no adapter:
+
+    pylate                — `models.ColBERT` + `losses.CachedContrastive` (GradCache),
+                            tokenized by `utils.ColBERTCollator` (the default)
+    sentence_transformers — `SentenceTransformer` (mean-pooling bi-encoder) +
+                            `MultipleNegativesRankingLoss`, tokenized by the
+                            trainer's default `SentenceTransformerDataCollator`
+
+Both subclass `SentenceTransformer`, so both run on the same trainer; `prepare()`
+locates and patches the wrapped `ModernBertModel` either way. (Raw HF `AutoModel`
+training transparency is `train_bench.py` — an AutoModel can't drive the
+SentenceTransformerTrainer; inference transparency across all three is
+`inference_bench.py`'s `framework` knob + `encode_transparency.py`.)
 
 A `TrainerCallback` records per-step loss / step time / peak VRAM from inside the
 real training loop, and the two runs are written out as loss curves plus the
 speed and memory deltas.
 
-    uv run benchmarks/pylate_trainer.py benchmarks/configs/msmarco_trainer.yml
+    uv run benchmarks/pylate_trainer.py benchmarks/configs/msmarco_trainer.yml  # pylate
+    uv run benchmarks/pylate_trainer.py benchmarks/configs/st_trainer.yml       # sentence_transformers
 """
 
 from __future__ import annotations
@@ -57,7 +73,6 @@ from sentence_transformers import (
 from transformers import TrainerCallback
 
 import flash_modernbert as fm
-from pylate import losses, models, utils
 
 
 # ---------------------------------------------------------------------------
@@ -83,32 +98,85 @@ def load_config(path: str) -> Config:
 # ---------------------------------------------------------------------------
 
 
-def build_colbert(cfg: Config) -> models.ColBERT:
+def framework_of(cfg: Config) -> str:
+    return cfg.section("model").get("framework", "pylate")
+
+
+def build_model(cfg: Config):
+    """Build the framework object `prepare()` will patch. Both branches return a
+    `SentenceTransformer` subclass (ColBERT is one), so both drive the same
+    `SentenceTransformerTrainer`; `prepare()` locates the wrapped ModernBertModel
+    in either."""
     section = cfg.section("model")
-    return models.ColBERT(
-        model_name_or_path=section["name_or_path"],
-        device="cuda",
-        embedding_size=int(section.get("embedding_size", 128)),
-        query_length=int(section.get("query_length", 32)),
-        document_length=int(section.get("document_length", 512)),
+    framework = framework_of(cfg)
+    if framework == "pylate":
+        from pylate import models
+
+        return models.ColBERT(
+            model_name_or_path=section["name_or_path"],
+            device="cuda",
+            embedding_size=int(section.get("embedding_size", 128)),
+            query_length=int(section.get("query_length", 32)),
+            document_length=int(section.get("document_length", 512)),
+        )
+    if framework == "sentence_transformers":
+        from sentence_transformers import SentenceTransformer
+
+        # Plain bi-encoder: a mean-pooling head over the same ModernBERT encoder
+        # (ModernBERT-base ships no ST pooling config, so ST adds mean pooling —
+        # fine for a transparency/speed A/B; the encoder is what prepare() patches).
+        model = SentenceTransformer(section["name_or_path"], device="cuda")
+        max_len = section.get("max_seq_length")
+        if max_len is not None:
+            model.max_seq_length = int(max_len)
+        return model
+    raise ValueError(
+        f"unknown framework {framework!r} (pylate | sentence_transformers); raw HF "
+        "AutoModel training transparency is benchmarks/train_bench.py"
     )
 
 
 def build_loss(cfg: Config, model):
+    """The framework's idiomatic contrastive loss. PyLate's reads the ColBERT
+    token embeddings (MaxSim); SentenceTransformers' reads the pooled bi-encoder
+    embedding. Both take in-batch negatives and the explicit negatives in the
+    triplet, so the recipe shape (anchor, positive, negatives) is shared."""
     section = cfg.section("loss")
     kind = section.get("type", "cached_contrastive")
+    framework = framework_of(cfg)
+    batch_size = int(cfg.section("trainer").get("batch_size", 16))
+    mini = int(section.get("mini_batch_size", batch_size))
+
+    if framework == "pylate":
+        from pylate import losses
+
+        if kind == "contrastive":
+            return losses.Contrastive(model=model)
+        if kind == "cached_contrastive":
+            return losses.CachedContrastive(model=model, mini_batch_size=mini)
+        raise ValueError(f"unknown pylate loss type {kind!r}")
+
+    # sentence_transformers: MultipleNegativesRankingLoss is the bi-encoder
+    # analogue of Contrastive; its Cached* variant is the GradCache analogue of
+    # CachedContrastive (same memory regime — chunked, no-grad-then-recompute).
+    from sentence_transformers import losses as st_losses
+
     if kind == "contrastive":
-        return losses.Contrastive(model=model)
+        return st_losses.MultipleNegativesRankingLoss(model=model)
     if kind == "cached_contrastive":
-        batch_size = int(cfg.section("trainer").get("batch_size", 16))
-        mini = int(section.get("mini_batch_size", batch_size))
-        return losses.CachedContrastive(model=model, mini_batch_size=mini)
-    raise ValueError(f"unknown loss type {kind!r}")
+        return st_losses.CachedMultipleNegativesRankingLoss(
+            model=model, mini_batch_size=mini
+        )
+    raise ValueError(f"unknown sentence_transformers loss type {kind!r}")
 
 
 def build_dataset(cfg: Config):
     section = cfg.section("dataset")
-    dataset = load_dataset(section["name"], split=section.get("split", "train"))
+    if section.get("type", "huggingface") == "synthetic":
+        return _synthetic_triplets(section)
+    dataset = load_dataset(
+        section["name"], section.get("config"), split=section.get("split", "train")
+    )
     take = section.get("select")
     if take is not None:
         dataset = dataset.select(range(min(int(take), len(dataset))))
@@ -119,6 +187,37 @@ def build_dataset(cfg: Config):
             instruction=section.get("query_instruction", ""),
         )
     return dataset
+
+
+def _synthetic_triplets(section: dict):
+    """An in-memory `(query, positive, negative_i)` text dataset of random words —
+    no network or dataset-schema dependency, so the framework-transparency A/B is
+    guaranteed to run anywhere. The loss reads the columns positionally
+    [anchor, positive, *negatives]; semantics are irrelevant to a speed/memory A/B
+    (both variants see identical data from the shared seed)."""
+    import random
+
+    from datasets import Dataset
+
+    n = int(section.get("num_samples", 512))
+    num_neg = int(section.get("num_negatives", 1))
+    q_words = int(section.get("query_words", 8))
+    d_words = int(section.get("doc_words", 90))   # ≈110 ModernBERT tokens
+    vocab = [f"tok{i}" for i in range(int(section.get("vocab", 2000)))]
+    rng = random.Random(int(section.get("seed", 42)))
+
+    def sentence(k):
+        return " ".join(rng.choice(vocab) for _ in range(k))
+
+    cols: dict[str, list] = {"query": [], "positive": []}
+    for i in range(num_neg):
+        cols[f"negative_{i}"] = []
+    for _ in range(n):
+        cols["query"].append(sentence(q_words))
+        cols["positive"].append(sentence(d_words))
+        for i in range(num_neg):
+            cols[f"negative_{i}"].append(sentence(d_words))
+    return Dataset.from_dict(cols)
 
 
 def _agent_ir_to_triplets(dataset, num_negatives: int, instruction: str):
@@ -227,9 +326,9 @@ def run_recipe(cfg: Config, variant: str, fused: bool, init_state: list, device:
     seed = int(cfg.section("trainer").get("seed", 42))
     torch.manual_seed(seed)
 
-    model = build_colbert(cfg)
+    model = build_model(cfg)
     # Pin both runs to the same weights so the only behavioral difference is
-    # prepare(); the ColBERT projection is otherwise randomly initialized.
+    # prepare() (the ColBERT projection / any head is otherwise randomly initialized).
     if init_state[0] is None:
         init_state[0] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     else:
@@ -244,6 +343,14 @@ def run_recipe(cfg: Config, variant: str, fused: bool, init_state: list, device:
     max_steps = int(run["max_steps"]) if run.get("max_steps") is not None else 10 ** 6
     callback = MetricsCallback(device, run.get("max_seconds"))
 
+    # PyLate tokenizes through its ColBERTCollator; SentenceTransformers lets the
+    # trainer pick its default SentenceTransformerDataCollator (data_collator=None).
+    collator = None
+    if framework_of(cfg) == "pylate":
+        from pylate import utils
+
+        collator = utils.ColBERTCollator(model.tokenize)
+
     with tempfile.TemporaryDirectory() as tmp:
         args = build_training_args(cfg, tmp, max_steps)
         trainer = SentenceTransformerTrainer(
@@ -251,7 +358,7 @@ def run_recipe(cfg: Config, variant: str, fused: bool, init_state: list, device:
             args=args,
             train_dataset=dataset,
             loss=loss,
-            data_collator=utils.ColBERTCollator(model.tokenize),
+            data_collator=collator,
             callbacks=[callback],
         )
         trainer.train()

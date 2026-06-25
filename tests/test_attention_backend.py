@@ -77,8 +77,9 @@ def test_prepare_rejects_unknown_backend():
 
 def test_flash_min_seq_is_arch_keyed(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    # end-to-end crossovers (see ops._FLASH_MIN_SEQ_BY_CC); last = unknown -> default
-    cases = {(12, 0): 256, (10, 0): 1024, (9, 0): 2048, (8, 0): 1024}
+    # end-to-end crossovers (see ops._FLASH_MIN_SEQ_BY_CC); (7, 0) = unknown -> default
+    cases = {(12, 0): 256, (10, 0): 1024, (9, 0): 2048,
+             (8, 9): 512, (8, 0): 1024, (7, 0): 1024}
     for cc, expected in cases.items():
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda cc=cc: cc)
         assert ops._resolve_flash_min_seq() == expected

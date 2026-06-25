@@ -27,9 +27,16 @@ from flash_modernbert.errors import ValidationError
 from flash_modernbert.locate import find_encoder
 from flash_modernbert.state import ATTR
 
-# Compute capabilities the fused tail is confirmed bit-identical on (2026-06-22):
-# sm_90 (H100/H200), sm_100 (B200), sm_120 (RTX 5090).
-VALIDATED_CAPABILITIES = frozenset({(9, 0), (10, 0), (12, 0)})
+# Compute capabilities the fused-tail FORWARD is numerically validated on:
+#   sm_90 (H100/H200), sm_100 (B200), sm_120 (RTX 5090) — 2026-06-22, bit-identical.
+#   sm_80 (A100), sm_89 (L40S/L4)                        — 2026-06-25, Modal probe
+#     (scripts/modal_arch_probe.py): the CuteDSL kernels JIT and the fused-vs-stock
+#     cosine is 0.999 / 0.998 / 0.999 at S=128 / 512 / 2048 (≥ the 0.997 band) — the
+#     cards people actually run ColBERT inference on. This gate certifies the FORWARD
+#     (what `_check_numerics` compares); the backward/training kernels are covered by
+#     the test suite on sm_90/100/120 and are NOT yet probed on sm_8x — run a backward
+#     probe before relying on sm_80/sm_89 for *training* (inference is forward-only).
+VALIDATED_CAPABILITIES = frozenset({(8, 0), (8, 9), (9, 0), (10, 0), (12, 0)})
 
 MIN_CUTLASS_DSL = (4, 5, 2)
 DEFAULT_SEQ_LENS = (128, 512, 2048)

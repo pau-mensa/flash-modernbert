@@ -260,11 +260,18 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
 #       drops. So this S-only table is a conservative floor; a token-budget (B·S)
 #       threshold would capture the large-B mid-S wins it leaves on the table.
 # H200's 2048 is conservative — measured a loss through S1024, did not measure S2048.
-# Unknown arch / no CUDA → 1024.
+# sm_80 (A100) / sm_89 (L40S/L4): MEASURED 2026-06-25 (scripts/modal_varlen_bench.py →
+# benchmarks/results/varlen_{a100,l40s}.json, B=16). Both run compiled FA2. A100 crosses
+# at S=1024 (flash/sdpa 0.92×@S512 → 1.24×@S1024 unpadded; 0.95× → 1.81× padded); L40S
+# crosses lower at S=512 (1.04×@S512 unpadded, 1.31× padded) — its FA2 has a lower fixed
+# cost than the A100's. Long-doc indexing wins are large (padded flash/sdpa up to 3.41×
+# @S4096 on A100, 2.30× on L40S). Unknown arch / no CUDA → 1024.
 _FLASH_MIN_SEQ_BY_CC = {
     (12, 0): 256,    # sm_120 — consumer Blackwell (5090), compiled FA2
     (10, 0): 1024,   # sm_100 — datacenter Blackwell (B200), cute FA4
     (9, 0): 2048,    # sm_90  — Hopper (H200), cute FA4: strong cuDNN sdpa + high FA4 floor
+    (8, 9): 512,     # sm_89  — Ada (L40S/L4), compiled FA2 (measured end-to-end crossover)
+    (8, 0): 1024,    # sm_80  — Ampere (A100), compiled FA2 (measured end-to-end crossover)
 }
 _FLASH_MIN_SEQ_DEFAULT = 1024
 

@@ -1,0 +1,34 @@
+# C1 — max-batch / OOM-frontier (fwd+bwd, bf16 weights, no optimizer state).
+# Binary-searches the largest batch each variant fits before OOM at a fixed S,
+# reporting the frontier on RESERVED memory (what actually decides OOM). The
+# headline: the eager fused tail trains a batch stock OOMs on — its in-place
+# backward (LN-bwd in-place, fused GeGLU+Wo-bwd) drops the saved-activation set
+# HF retains, and that saving scales with B·S, so it is widest at the frontier.
+run:
+  validate: true            # run the flash-modernbert hard gate before measuring
+  n_iters: 5                # fwd+bwd steps timed at each variant's frontier batch
+  start_b: 8                # exponential-ramp start; doubles until OOM, then bisects
+  max_b: 8192               # search cap (also the frontier if a variant never OOMs)
+
+model:
+  name_or_path: answerdotai/ModernBERT-base
+  dtype: bfloat16
+
+# Two sequence lengths bracket the regimes: S=512 (the fused tail's classic win)
+# and S=2048 (long-S indexing, where the per-sample activation saving — hence the
+# batch headroom — is largest). The frontier batch falls as S grows.
+seq_lens: [512, 2048]
+
+# sdpa is the headline (dep-free, the memory story is the fused-tail backward).
+# flash is included because its varlen/windowed path can shift the frontier too.
+attention_backends: [sdpa, flash]
+
+# Training-graph frontier: off by default. When on, expect it to OOM at a LOWER
+# batch than eager-fused — each captured shape pins its own persistent activation
+# pool (graphs cost more reserved, not less; see roadmap Workstream B). Included
+# only to show that honestly.
+include_graph: false
+
+output:
+  dir: benchmarks/results
+  name: max_batch
