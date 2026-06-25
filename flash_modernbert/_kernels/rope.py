@@ -6,39 +6,25 @@ Drop-in for `op_apply_rope` in `reference.py`. For each (b, h, s, d):
     y[..., d_high] = x[..., d_high] * cos[s, d_high] + x[..., d_low]  * sin[s, d_high]
 
 where d_low ∈ [0, D/2) and d_high = d_low + D/2. This is the "half-rotation"
-RoPE (concat-half), matching HuggingFace's ModernBert. Compute is in fp32, with
-inputs/outputs in bf16 — same as the reference.
+RoPE (concat-half), matching HuggingFace's ModernBert. Compute is fp32, I/O bf16.
 
-**Design (v2 — coalesced shuffle).** See `docs/fused_tail_encoder_m1.md` (M1 item 3).
+**Design — coalesced shuffle.** A naive kernel (thread `t` owns the pair
+`(t, t+D/2)`, reading the two halves as separate strided streams) stalls at ~12% HBM
+peak: packing short D=64 rows into a warp makes each load's footprint non-contiguous.
+The fix keeps global I/O contiguous and resolves the low↔high pairing with an
+intra-warp butterfly shuffle instead of a second memory stream:
 
-The naive kernel (one block per (b,h,s), thread `t` owns the pair `(t, t+D/2)`)
-and a vectorized variant that read the low and high halves as two separate
-strided streams both stall at ~12–14% HBM peak. The killer is the access
-*pattern*: packing short D=64 rows so several share a warp makes each load
-instruction's warp footprint non-contiguous (8 rows × 64-byte half-segments,
-64-byte gaps). GeGLU streams long contiguous 1152-wide rows and hits ~47%; RoPE
-could not, *not* because of the rotation math, but because of that scatter.
+- Flatten q/k to `[B*H, S, D]`; a block owns R consecutive `s` rows of one (b,h),
+  contiguous in memory.
+- Each thread owns one `vec=8` chunk and loads only its 8 elements, so the 32 lanes
+  read 256 contiguous elements per load — coalesced.
+- The rotation pairs chunk `c` with chunk `c ^ (D/2/vec)`; the partner's data arrives
+  via `shuffle_sync_bfly`, no second load. Low chunks subtract `partner*sin`, high add.
+- q and k share cos/sin and the shuffle setup in one kernel.
 
-The fix here keeps global I/O fully contiguous and resolves the low↔high pairing
-with an **intra-warp butterfly shuffle** instead of a second memory stream:
-
-- Flatten q/k to `[B*H, S, D]`; grid = (B*H, ceil(S/R)). A block owns R
-  consecutive `s` rows of one (b,h) → its rows are contiguous in memory.
-- Each thread owns ONE `vec=8` chunk (16 B) and loads only its own 8 elements,
-  so the 32 warp lanes read 256 contiguous elements per load — coalesced.
-- The rotation pairs chunk `c` (offset `c*8`) with chunk `c ^ (D/2/vec)` (the
-  other half). That partner lane's data arrives via `shuffle_sync_bfly`; no
-  second strided load. Low chunks subtract `partner*sin`, high chunks add it.
-- q AND k share the same cos/sin and the same shuffle setup in one kernel.
-
-This lands at **~29% peak / 2.34× over the v1 kernel** (87 vs 203 µs at
-B=8/S=4096). The remaining gap to GeGLU is structural and characterised in the
-doc: RoPE is *latency*-bound (D=64 rows are too short, the shuffle is mandatory,
-and it touches 4 buffers q-in/k-in/q-out/k-out) — the q+k-only ceiling is ~33%,
-cos/sin costs only ~4 points (halving it via shuffle *backfires*), splitting
-q/k into separate launches is *worse* (q-only is 23% — fewer in-flight loads per
-thread = less latency hiding), and vec=16 is far worse. cos/sin are passed as
-`[S, D]` (broadcast batch dim sliced upstream — identical across batch).
+Lands at ~29% peak / 2.34× the naive kernel; it's latency-bound (D=64 rows are short),
+so splitting q/k or widening to vec=16 both regress. cos/sin are `[S, D]` (the broadcast
+batch dim is sliced upstream — identical across batch).
 """
 
 from __future__ import annotations

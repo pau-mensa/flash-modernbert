@@ -11,8 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from torch import nn
-
 from flash_modernbert.config import ModernBertParams
 from flash_modernbert.errors import FlashModernBertError
 from flash_modernbert.locate import find_encoder
@@ -41,7 +39,3 @@ def get_state(target: object) -> PatchState:
             "this model has not been prepared with flash_modernbert.prepare()"
         )
     return state
-
-
-def encoder_of(target: object) -> nn.Module:
-    return find_encoder(target)

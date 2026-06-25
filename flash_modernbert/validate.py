@@ -1,15 +1,9 @@
 """`validate()` — the hard gate that decides whether the fused path is safe.
 
-This is the package's headline rule: enabling on a mismatched architecture or an
-unvalidated device would produce *wrong embeddings*, not merely slower ones, so
-every check below raises rather than degrading silently. (A perf fallback — an
-out-of-bucket shape running eager instead of graphed — is fine and lives in the
-graph runner; that path is numerically identical.)
-
-The gate covers: the model architecture (and, implicitly, the split-half RoPE
-convention the kernels assume), the compute capability against the validated
-matrix, that the CuteDSL toolchain can actually JIT a kernel on this machine, and
-that the fused forward tracks stock HF within the bf16 band.
+Enabling on a mismatched arch or unvalidated device would produce *wrong embeddings*,
+so every check raises rather than degrading silently. The gate covers: model
+architecture, compute capability against the validated matrix, that the CuteDSL
+toolchain can JIT a kernel here, and that the fused forward tracks stock HF in bf16.
 """
 
 from __future__ import annotations
@@ -27,23 +21,16 @@ from flash_modernbert.errors import ValidationError
 from flash_modernbert.locate import find_encoder
 from flash_modernbert.state import ATTR
 
-# Compute capabilities the fused-tail FORWARD is numerically validated on:
-#   sm_90 (H100/H200), sm_100 (B200), sm_120 (RTX 5090) — 2026-06-22, bit-identical.
-#   sm_80 (A100), sm_89 (L40S/L4)                        — 2026-06-25, Modal probe
-#     (scripts/modal_arch_probe.py): the CuteDSL kernels JIT and the fused-vs-stock
-#     cosine is 0.999 / 0.998 / 0.999 at S=128 / 512 / 2048 (≥ the 0.997 band) — the
-#     cards people actually run ColBERT inference on. This gate certifies the FORWARD
-#     (what `_check_numerics` compares); the backward/training kernels are covered by
-#     the test suite on sm_90/100/120 and are NOT yet probed on sm_8x — run a backward
-#     probe before relying on sm_80/sm_89 for *training* (inference is forward-only).
+# Compute capabilities the fused-tail FORWARD is numerically validated on (sm_90/100/120
+# bit-identical; sm_80/sm_89 within the 0.997 band, scripts/modal_arch_probe.py). This
+# gate certifies only the forward — training on sm_8x is not yet probed.
 VALIDATED_CAPABILITIES = frozenset({(8, 0), (8, 9), (9, 0), (10, 0), (12, 0)})
 
 MIN_CUTLASS_DSL = (4, 5, 2)
 DEFAULT_SEQ_LENS = (128, 512, 2048)
-# The bf16 band, not an exactness check. At S>=512 stock HF's own SDPA and eager
-# backends only agree to ~0.998 in bf16, and the fused path tracks SDPA at least
-# that tightly; 0.997 sits just under that floor so a genuine divergence (which
-# lands far lower) is still caught.
+# A bf16 band, not an exactness check: stock HF's own SDPA and eager backends only
+# agree to ~0.998 at S>=512, and 0.997 sits just under that so a real divergence
+# (which lands far lower) is still caught.
 DEFAULT_COS_THRESHOLD = 0.997
 
 

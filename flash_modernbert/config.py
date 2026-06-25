@@ -1,8 +1,7 @@
-"""The slice of ModernBERT config the fused forward actually consumes.
+"""The slice of ModernBERT config the fused forward consumes.
 
-`ModernBertParams` is built from a Hugging Face config once at `prepare()` time
-and read on every forward. Deriving it up front decouples the forward from HF's
-config-schema churn — notably the transformers 5.x move of the RoPE thetas under
+Built from a HF config once at `prepare()` time, decoupling the forward from HF's
+schema churn — notably the transformers 5.x move of the RoPE thetas under
 `rope_parameters[{full,sliding}_attention]`, which `from_hf_config` absorbs.
 """
 

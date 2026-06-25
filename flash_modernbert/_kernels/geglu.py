@@ -7,22 +7,10 @@ Drop-in for the elementwise step inside `op_geglu_mlp` in `reference.py`:
     activated = gelu_exact(a) * gate          # ← THIS KERNEL
     out   = activated @ Wo^T    # done in cuBLAS
 
-We use exact GeLU (`approximate="none"` in PyTorch), matching HF mmBERT's
-`hidden_activation = "gelu"`:
-
-    gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
-
-Compute is fp32; input/output dtype is whatever the caller passed (bf16 in
-mmBERT).
-
-**Design (correctness-first v1).**
-
-- One block per row of the flattened `[N, 2*I]` matrix; threads cooperate
-  along the intermediate dim `I`.
-- 128 threads per block (4 warps). For mmBERT `I=1152` each thread owns
-  exactly 9 elements (1152 = 9 × 128) — no predicate needed in steady state,
-  but we keep one for general `I`.
-- Closure-factory specialization by `I` (same pattern as the other kernels).
+Exact GeLU (`approximate="none"`), matching HF mmBERT's `hidden_activation="gelu"`:
+`gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))`. Compute is fp32; I/O dtype is the
+caller's (bf16 in mmBERT). One block per row of `[N, 2*I]`, threads cooperate along
+`I`; specialized by `I` via a closure factory (same pattern as the other kernels).
 """
 
 from __future__ import annotations
@@ -53,15 +41,10 @@ def _pick_threads_fwd(intermediate: int, vec: int) -> int:
 
 
 def _build_for_i(intermediate: int):
-    """Specialize the GeGLU forward for a fixed intermediate-size `I`.
-
-    Vectorized (128-bit `cute.autovec_copy`) when `I` is a multiple of `VEC_FWD`,
-    else a scalar fallback. GeGLU forward is pure elementwise (no reduction), so it
-    streams; on B200 the vectorized path is ~1.4x the old scalar kernel and ~3.2x
-    torch eager, and it is memory-latency-bound — the exact-gelu `erf` is fully
-    hidden (an identity-activation variant is no faster), so there is no point
-    approximating the activation. See `docs/fused_tail_encoder_m1.md`.
-    """
+    """Specialize the GeGLU forward for a fixed `I`: vectorized (128-bit
+    `autovec_copy`) when `I` is a multiple of `VEC_FWD`, else scalar. It's
+    memory-latency-bound — the exact-gelu `erf` is fully hidden, so there's no point
+    approximating the activation."""
     assert intermediate > 0
     if intermediate % VEC_FWD == 0:
         return _build_vec_for_i(intermediate, _pick_threads_fwd(intermediate, VEC_FWD), VEC_FWD)
@@ -142,34 +125,21 @@ def _get_jit(intermediate: int):
 
 
 # ---------------------------------------------------------------------------
-# Backward
+# Backward — one fused kernel (replaces a 3-launch gelu_backward + multiply + cat),
+# recomputing gelu(a)/gelu'(a) once per element:
+#   da[i,j]    = dy[i,j] * gate[i,j] * gelu'(a[i,j])
+#   dgate[i,j] = dy[i,j] * gelu(a[i,j])
+# concatenated into grad_proj [N, 2*I]. No reductions.
 # ---------------------------------------------------------------------------
-#
-# Per element of the [N, I] grad_out tensor, we produce two outputs:
-#   da[i, j]    = dy[i, j] * gate[i, j] * gelu'(a[i, j])
-#   dgate[i, j] = dy[i, j] * gelu(a[i, j])
-# concatenated along the last dim into grad_proj [N, 2*I]. No reductions.
-#
-# Replaces a 3-launch chain (gelu_backward + multiply + cat) with a single
-# fused kernel that recomputes gelu(a) and gelu'(a) once per element.
 
 _INV_SQRT_2PI = float(1.0 / math.sqrt(2.0 * math.pi))
 
 
 def _build_bwd_for_i(intermediate: int):
-    """Specialize the backward kernel for a fixed intermediate-size `I`.
-
-    Scalar (one warp-strided element stream, 128 threads). Unlike the FORWARD —
-    where 128-bit `autovec_copy` won 1.41× — vectorizing the BACKWARD measured
-    *slower* on B200 (M=32768: 130 µs vec vs 106 µs scalar, ~1.22× regression;
-    `scripts/_probe_tail_bwd_b200.py --only geglubwd`). The backward streams 5
-    vec buffers (load a-half, gate-half, dy; store da, dgate) vs the forward's 3,
-    and the extra register pressure costs more occupancy than the wider
-    transactions buy. This mirrors the LayerNorm autovec backfire — the right
-    access pattern is task-dependent and must be measured per kernel
-    (`docs/fused_tail_encoder_m1.md`). The scalar bwd is already ~12-14× torch
-    eager, so it is not the bottleneck.
-    """
+    """Specialize the backward for a fixed `I`. Scalar, *not* vectorized: unlike the
+    forward (where `autovec_copy` won 1.41×), vectorizing the backward measured slower
+    on B200 (~1.22× regression) — it streams 5 vec buffers vs the forward's 3, and the
+    extra register pressure costs more occupancy than the wider transactions buy."""
     assert intermediate > 0
     threads = THREADS_PER_BLOCK
     elems_per_thread = (intermediate + threads - 1) // threads
@@ -259,10 +229,8 @@ def geglu_bwd(
     flat_proj = proj_d.reshape(-1, 2 * intermediate).contiguous()
     flat_grad = grad_d.reshape(-1, intermediate).contiguous()
     if inplace and grad_proj_dtype == proj.dtype:
-        # Per-element kernel: thread t reads (col, col+I) of proj, writes
-        # back to the same positions of grad_proj. Safe to alias the two.
-        # Saves the (B*S, 2I) grad_proj allocation — at B=2048 that's
-        # 1.12 GB per layer × 22 layers, which is what unblocks B=2048.
+        # Per-element kernel reads (col, col+I) and writes the same positions, so
+        # aliasing proj and grad_proj is safe — saves the (B*S, 2I) allocation.
         grad_proj = flat_proj
     else:
         grad_proj = torch.empty(

@@ -1,32 +1,21 @@
-"""CUDA-graph layer — a separable speedup on top of the eager fused forward.
+"""CUDA-graph layer for inference — a separable speedup, off by default.
 
-Off by default. Its job is the short-sequence regime where the eager fused tail
-is host-launch-bound (hundreds of tiny CuteDSL launches per forward); capturing
-the encoder core into a graph collapses that launch floor to a single replay.
+Targets the short-sequence regime where the eager fused tail is host-launch-bound;
+capturing the forward into a graph collapses the launch floor to a single replay.
+One graph per shape, so the runner buckets by `(batch, seq_bucket)`; out-of-bucket
+or oversized shapes fall back to the (numerically identical) eager forward.
 
-One graph captures one shape, so the runner buckets: sequence length is rounded
-up to `pad_to` and the padded region is masked out (the fused tail is leak-free
-under padding). The capture boundary is the **whole** fused forward — prologue
-(embeddings, RoPE tables, SDPA masks) *and* `core` (the layer loop + final norm)
-— captured from the static `input_ids`/`attention_mask` buffers. So the only
-per-replay host work is copying those two `(B, S)` int tensors in; everything
-downstream is replayed. This matters most at long S, where the prologue's `S×S`
-sliding mask would otherwise be rebuilt and copied every call. The prologue's one
-host sync (the mask `isinf().any()` probe) is removed under `capture_safe=True`.
-Out-of-bucket or oversized shapes fall back to the eager forward, which is
-numerically identical, just un-graphed.
+The capture boundary is the *whole* fused forward (prologue + core), captured from
+the static `input_ids`/`attention_mask` buffers, so the only per-replay host work is
+copying those two `(B, S)` int tensors. Two correctness requirements:
 
-Correctness rests on the CuteDSL launches inside the captured region taking the
-capture stream: `_kernels._compile_cache.current_cute_stream()` threads the
-active stream into every launch, so capture records them. Without it,
-default-stream launches are silently missed and replay produces stale output.
-
-A captured graph replays against fixed memory addresses, so it is an
-**inference** feature: it must not be used while autograd is building a graph or
-while autocast is active. Autocast caches ephemeral bf16 weight copies and frees
-them when its context exits, so a graph captured under autocast would replay
-against freed memory. The patched forward enforces this — it only routes through
-the runner when both autograd and autocast are off (plain bf16 inference).
+- The CuteDSL launches inside the captured region must take the capture stream —
+  `_compile_cache.current_cute_stream()` threads it into every launch. Without it,
+  default-stream launches are silently missed and replay produces stale output.
+- A graph replays against fixed addresses, so it is inference-only: never under
+  autograd (building a graph) or autocast (which frees its ephemeral bf16 weight
+  copies at context exit — the graph would replay against freed memory). The patched
+  forward enforces this, routing through the runner only when both are off.
 """
 
 from __future__ import annotations
@@ -41,56 +30,36 @@ from torch import Tensor, nn
 
 from flash_modernbert import forward
 from flash_modernbert.config import ModernBertParams
-from flash_modernbert.state import encoder_of, get_state
+from flash_modernbert.locate import find_encoder
+from flash_modernbert.state import get_state
 
 GRAPH_ENV_VAR = "FLASH_MODERNBERT_GRAPH"
 
 
 def graphs_globally_disabled() -> bool:
-    """The `FLASH_MODERNBERT_GRAPH=0` kill switch (mirrors PYLATE_DISABLE_LIK)."""
+    """The `FLASH_MODERNBERT_GRAPH=0` kill switch."""
     return os.environ.get(GRAPH_ENV_VAR, "1") == "0"
 
 
 @dataclass(frozen=True)
 class GraphConfig:
-    """Bucketing policy for the graph runner.
+    """Bucketing policy for the graph runner: one graph per `(batch, seq_bucket)`,
+    `seq_bucket = ceil(seq_len / pad_to) * pad_to` (the padded tail is masked out).
 
-    The runner holds one captured graph per `(batch, seq_bucket)` key, where
-    `seq_bucket = ceil(seq_len / pad_to) * pad_to`. Two knobs bound how many keys
-    that produces under variable-length, variable-batch inference:
-
-    - `pad_to` collapses the **sequence** dimension into buckets (the padded tail
-      is masked out — the fused tail is leak-free under padding).
-    - `max_batch` collapses the **batch** dimension. Left `None`, each distinct
-      batch size captures its own graph (fine when batch size is fixed). Set to
-      the encode batch size, every batch with `b <= max_batch` replays a single
-      `max_batch`-row graph (batch dim padded, the first `b` rows sliced out), and
-      `b > max_batch` falls back to eager. This is the "round B up to max_batch"
-      policy: it collapses the batch dimension to one graph per sequence bucket —
-      the strongest cache bound for variable-batch workloads (e.g. an indexing
-      run whose last batch is partial) — at the cost of computing the few padded
-      rows on a partial batch.
-
-    Capture is lazy by default. Set `seq_buckets` (together with `max_batch`, which
-    supplies the batch dim) to pre-capture those buckets at `prepare()` time, when
-    deterministic warm-up latency matters more than flexibility.
-
-    The cache is bounded at `max_graphs` by LRU eviction: once full, capturing a
-    new bucket evicts the least-recently-replayed one (freeing its graph), so the
-    hot working set stays graphed even under an unbounded stream of shapes. A
-    single shape larger than `max_tokens` is never captured (always eager).
-
-    `max_seq` (default None = no cutoff, graph any length) gates by sequence length:
-    a call with `s > max_seq` runs eager and is never captured. Graphs win at short
-    S (the launch-floor collapse) but at long S the eager fused tail is faster
-    (a captured graph needs a static dense mask, which precludes SDPA's flash fast
-    path) and — measured with `max_memory_reserved`, not `allocated` — graphs do not
-    actually save memory there either (the private pool is real, just invisible to
-    `allocated`). So for short-S query *serving* a cutoff routes long docs to the
-    faster eager path at no cost. It is left None by default so explicit long-S
-    *indexing* configs (`seq_buckets` + `max_batch`) keep graphing as before;
-    `prepare(cuda_graph=True, cuda_graph_seq_cutoff=...)` sets it for the plain
-    bool-enable path.
+    - `pad_to` buckets the sequence dimension.
+    - `max_batch` buckets the batch dimension: left `None`, each batch size captures
+      its own graph; set, every `b <= max_batch` replays one padded `max_batch`-row
+      graph (the first `b` rows sliced out) and `b > max_batch` falls back to eager —
+      the strongest cache bound for variable-batch workloads (e.g. partial last batch).
+    - `seq_buckets` (with `max_batch`) pre-captures those buckets at `prepare()` time
+      instead of lazily.
+    - `max_graphs` bounds the cache by LRU eviction; a shape over `max_tokens` is
+      never captured.
+    - `max_seq` (default None = no cutoff) runs `s > max_seq` eager. Graphs win at
+      short S but lose at long S on both latency (the static dense mask precludes
+      SDPA's flash path) and memory — measured with `max_memory_reserved`, not
+      `allocated`, which hides a graph's private pool. So the cutoff keeps graphs on
+      short-S query *serving*; left None so long-S indexing configs keep graphing.
     """
 
     pad_to: int = 64
@@ -115,20 +84,15 @@ class _Captured:
 
 @dataclass
 class _StaticInputs:
-    """The graph's fixed input buffers. The capture boundary is the *whole*
-    forward (prologue + core), so the only things that vary per replay are the
-    token ids and the attention mask — everything downstream (embeddings, RoPE
-    tables, SDPA masks) is recomputed inside the captured region. This keeps the
-    per-replay copy to two `(B, S)` int tensors instead of the post-prologue
-    activations and the `S×S` masks."""
+    """The graph's fixed input buffers — only the token ids and mask vary per replay."""
 
     input_ids: Tensor
     attention_mask: Tensor
 
     def stage(self, input_ids: Tensor, attention_mask: Tensor | None) -> None:
-        """Write a real `(b, s)` batch into the `(bb, sb)` static buffers: zero
-        them (so a smaller shape leaves the padded tail masked/empty), then fill
-        the live region; dummy rows beyond `b` are marked valid (sliced off)."""
+        """Write a real `(b, s)` batch into the `(bb, sb)` static buffers: zero them
+        (so the padded tail stays empty), fill the live region; rows beyond `b` are
+        marked valid (they get sliced off)."""
         b, s = input_ids.shape
         bb = self.input_ids.shape[0]
         self.input_ids.zero_()
@@ -157,18 +121,16 @@ class _GraphRunner:
         self._config = config
         self._backend = backend
         self._cache: "OrderedDict[tuple[int, int], _Captured]" = OrderedDict()
-        param = next(model.parameters())
-        self._device = param.device
-        self._dtype = param.dtype
+        self._device = next(model.parameters()).device
 
     def __call__(self, input_ids: Tensor, attention_mask: Tensor | None) -> Tensor:
         b, s = input_ids.shape
         max_seq = self._config.max_seq
         if max_seq is not None and s > max_seq:
-            return self._eager(input_ids, attention_mask)  # long S: eager fused is faster, no mem win
+            return self._eager(input_ids, attention_mask)  # long S: eager is faster, no mem win
         max_batch = self._config.max_batch
         if max_batch is not None and b > max_batch:
-            return self._eager(input_ids, attention_mask)  # batch too large for the bucket
+            return self._eager(input_ids, attention_mask)
         bb = b if max_batch is None else max_batch
         sb = _round_up(s, self._config.pad_to)
         key = (bb, sb)
@@ -180,7 +142,7 @@ class _GraphRunner:
             captured = self._capture(bb, sb)
             self._insert(key, captured)
         else:
-            self._cache.move_to_end(key)  # LRU: mark as recently replayed
+            self._cache.move_to_end(key)  # LRU
 
         captured.inputs.stage(input_ids, attention_mask)
         captured.graph.replay()
@@ -192,12 +154,10 @@ class _GraphRunner:
         )
 
     def _insert(self, key: tuple[int, int], captured: "_Captured") -> None:
-        """Insert a freshly captured graph, evicting the least-recently-replayed
-        one if the cache is at capacity (LRU), so it stays bounded at max_graphs."""
         self._cache[key] = captured
         while len(self._cache) > self._config.max_graphs:
             old_key, old = self._cache.popitem(last=False)
-            del old  # drop the CUDAGraph + static buffers so their memory frees
+            del old  # frees the CUDAGraph + static buffers
 
     def _capture(self, b: int, sb: int) -> _Captured:
         static = _StaticInputs(
@@ -218,9 +178,7 @@ class _GraphRunner:
         return _Captured(graph=graph, inputs=static, out=out)
 
     def _run_forward(self, static: _StaticInputs) -> Tensor:
-        """The captured region: the whole fused forward (prologue + core), run
-        capture-safe (no host sync in the prologue) from the static id/mask
-        buffers."""
+        """The captured region: the whole fused forward, run capture-safe."""
         p = forward.prologue(
             self._model, self._params, static.input_ids, static.attention_mask,
             dense_mask=True, capture_safe=True,
@@ -271,7 +229,7 @@ def set_cuda_graph(model: object, enabled: bool, *, config: GraphConfig | None =
     state = get_state(model)
     if enabled and state.graph_runner is None:
         state.graph_runner = build_runner(
-            encoder_of(model), state.params, config or GraphConfig(),
+            find_encoder(model), state.params, config or GraphConfig(),
             backend=state.attention_backend,
         )
     state.graph_enabled = enabled

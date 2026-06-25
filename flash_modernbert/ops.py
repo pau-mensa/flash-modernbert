@@ -1,17 +1,10 @@
-"""The fused-tail numerical ops: autograd Functions + their dispatch wrappers.
+"""The fused-tail numerical ops: LayerNorm, RoPE, GeGLU.
 
-Only the three tails that the fused path swaps onto ModernBERT live here —
-LayerNorm, RoPE, and GeGLU. Each is a `torch.autograd.Function` whose forward is
-a CuteDSL kernel and whose backward is the equivalent math run directly (the same
-ATen op the engine would call, or a hand-rolled exact gradient), with no second
-forward and no autograd subgraph built per call. GEMMs stay on cuBLAS (`F.linear`)
-and attention stays on vendor SDPA; those are not autograd Functions, just the
-plain ops below.
-
-The `fused_*` wrappers pick the autograd Function when a gradient is actually
-needed (training, or fp32-master-weights under autocast) and the raw detached
-kernel otherwise (inference, GradCache pass-1), so the no-grad path never pays for
-ctx bookkeeping it won't use.
+Each is a `torch.autograd.Function` wrapping a CuteDSL forward kernel and an exact
+backward (no second forward, no per-call autograd subgraph). GEMMs and attention
+stay on cuBLAS / vendor SDPA. The `fused_*` wrappers route through autograd only
+when a gradient is live (training, or fp32-master under autocast) and the raw
+detached kernel otherwise, so the no-grad path skips ctx bookkeeping.
 """
 
 from __future__ import annotations
@@ -37,11 +30,9 @@ from flash_modernbert._kernels.rope import apply_rope as _rope_kernel
 
 
 class _LayerNormFn(torch.autograd.Function):
-    """Forward: `layer_norm_with_stats` yields y plus the flat fp32 mean/rstd in
-    one kernel. Backward: the M-dynamic `ln_bwd` computes grad_x and grad_gamma in
-    one launch from those stats. Both are re-JIT-free across the token count, so a
-    new sequence length never triggers a recompile. Falls back to ATen for the
-    dtype/H the cute reduction does not cover (H must be a multiple of 256)."""
+    """Cute forward yields y + fp32 mean/rstd; cute backward computes grad_x/grad_gamma
+    from those stats in one launch. Both are re-JIT-free across token count. Falls back
+    to ATen when the cute reduction can't cover the dtype/H (H must be a multiple of 256)."""
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16)
@@ -97,17 +88,12 @@ class _LayerNormFn(torch.autograd.Function):
         return grad_input, grad_weight, None
 
 
-def layer_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Autograd-aware bias-free LayerNorm."""
-    return _LayerNormFn.apply(x, weight, eps)
-
-
 def fused_layer_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """LayerNorm that routes through autograd only when a gradient is live.
 
-    fp32 master weights under bf16 autocast (HF Trainer / PyLate) must go through
-    the `custom_fwd` cast wrapper even in a no-grad pass so x and gamma are cast
-    together — the raw kernel requires equal dtypes.
+    fp32 master weights under bf16 autocast must still go through the `custom_fwd`
+    cast wrapper even in a no-grad pass, so x and gamma are cast to the same dtype
+    (the raw kernel requires equal dtypes).
     """
     if torch.is_autocast_enabled("cuda") or (
         torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
@@ -122,9 +108,7 @@ def fused_layer_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch
 
 
 class _ApplyRopeFn(torch.autograd.Function):
-    """RoPE is linear, so its transpose Jacobian is the conjugate rotation:
-    backward is the same kernel with sin negated. No autograd graph, no recompute.
-    """
+    """RoPE is linear, so backward is the same kernel with sin negated."""
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16)
@@ -145,11 +129,6 @@ class _ApplyRopeFn(torch.autograd.Function):
         return grad_q, grad_k, None, None
 
 
-def apply_rope(q, k, cos, sin):
-    """Autograd-aware RoPE."""
-    return _ApplyRopeFn.apply(q, k, cos, sin)
-
-
 def fused_apply_rope(q, k, cos, sin):
     if torch.is_grad_enabled() and (
         q.requires_grad or k.requires_grad or cos.requires_grad or sin.requires_grad
@@ -164,8 +143,8 @@ def fused_apply_rope(q, k, cos, sin):
 
 
 class _GegluFn(torch.autograd.Function):
-    """Forward: `gelu(a) * gate` in one kernel. Backward: a single fused kernel
-    recomputes gelu(a)/gelu'(a) and writes (da, dgate) into proj's storage."""
+    """Forward: `gelu(a) * gate` in one kernel. Backward: one fused kernel recomputes
+    gelu and writes (da, dgate) back into proj's storage."""
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16)
@@ -185,11 +164,6 @@ class _GegluFn(torch.autograd.Function):
             proj, grad_act, grad_proj_dtype=proj.dtype, inplace=True
         )
         return grad_proj, None
-
-
-def geglu(proj, *, out_dtype=None):
-    """Autograd-aware GeGLU."""
-    return _GegluFn.apply(proj, out_dtype)
 
 
 def fused_geglu(proj, *, out_dtype=None):
@@ -222,10 +196,8 @@ def geglu_mlp_pre_ln(x, w_in, w_out, gamma, eps):
 
 
 def sdpa_attention(q, k, v, additive_mask, scaling):
-    """q/k/v are strided [B, H, S, D] transpose views; SDPA reads them as-is
-    (no contiguous copy, bit-identical to contiguous on the validated arches).
-    `additive_mask` must already be SDPA-ready (finite, dtype-matched, or None) —
-    the prologue prepares it once per forward."""
+    """q/k/v are strided [B, H, S, D] transpose views; SDPA reads them with no copy.
+    `additive_mask` must already be SDPA-ready (finite, dtype-matched, or None)."""
     out = F.scaled_dot_product_attention(
         q, k, v,
         attn_mask=additive_mask,
@@ -238,34 +210,12 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
     return out.reshape(b, s, -1)
 
 
-# Sequence-length threshold for the "auto" backend: at/above it flash beats sdpa,
-# below it flash's fixed-cost floor loses. The crossover is **arch-dependent**, so
-# this is keyed on compute capability rather than one global line. The values are the
-# measured **end-to-end** crossovers (full encoder forward, not attention in
-# isolation) — `benchmarks/{varlen_bench.py (5090), results/varlen_b200_h200.json}`:
-#
-#   sm_120 (5090, compiled FA2): 256  — ties ~S256, wins by S512 (B32). Low FA2 floor.
-#   sm_100 (B200, cute FA4):     1024 — loses at S512 (0.80×), wins at S1024 (1.10×).
-#   sm_90  (H200, cute FA4):     2048 — loses through S1024 (0.83×); crossover >1024.
-#
-# Two caveats baked into these (both push the threshold UP vs the attention-only
-# `attn_backend_micro.py` crossover, which gave an over-optimistic 128/512/1024):
-#   (1) End-to-end ≠ attention-only. The non-attention ops (GEMMs/LN/GeGLU) and the
-#       varlen unpad/repad + per-layer kernel launches dilute and offset flash's
-#       attention win, so flash needs a larger S to come out ahead than the isolated
-#       attention op does — especially on the high-fixed-cost cute-FA4 datacenter arches.
-#   (2) Batch-dependent. These were measured at small batch (B=8 on B200/H200), where
-#       those very fast GPUs are *launch-bound* (sdpa time is ~flat in S) and flash's
-#       per-layer launch overhead dominates. At larger B (compute-bound) the crossover
-#       drops. So this S-only table is a conservative floor; a token-budget (B·S)
-#       threshold would capture the large-B mid-S wins it leaves on the table.
-# H200's 2048 is conservative — measured a loss through S1024, did not measure S2048.
-# sm_80 (A100) / sm_89 (L40S/L4): MEASURED 2026-06-25 (scripts/modal_varlen_bench.py →
-# benchmarks/results/varlen_{a100,l40s}.json, B=16). Both run compiled FA2. A100 crosses
-# at S=1024 (flash/sdpa 0.92×@S512 → 1.24×@S1024 unpadded; 0.95× → 1.81× padded); L40S
-# crosses lower at S=512 (1.04×@S512 unpadded, 1.31× padded) — its FA2 has a lower fixed
-# cost than the A100's. Long-doc indexing wins are large (padded flash/sdpa up to 3.41×
-# @S4096 on A100, 2.30× on L40S). Unknown arch / no CUDA → 1024.
+# Per-arch sequence-length threshold for the "auto" backend: at/above it flash beats
+# sdpa, below it flash's fixed-cost floor loses. The crossover is arch-dependent, so
+# this keys on compute capability. Values are the measured *end-to-end* crossovers
+# (full encoder forward, not attention in isolation — which runs higher than the
+# attention-only micro-benchmark and is a conservative floor at small batch, where
+# fast GPUs are launch-bound). See benchmarks/varlen_bench.py and results/varlen_*.json.
 _FLASH_MIN_SEQ_BY_CC = {
     (12, 0): 256,    # sm_120 — consumer Blackwell (5090), compiled FA2
     (10, 0): 1024,   # sm_100 — datacenter Blackwell (B200), cute FA4
@@ -277,9 +227,7 @@ _FLASH_MIN_SEQ_DEFAULT = 1024
 
 
 def _resolve_flash_min_seq() -> int:
-    """The per-GPU `"auto"` flash threshold (see `_FLASH_MIN_SEQ_BY_CC`). Guarded so
-    a CPU-only import (e.g. the pure-logic tests) gets the safe 1024 fallback rather
-    than touching CUDA."""
+    """The per-GPU `"auto"` flash threshold; falls back to the default without CUDA."""
     try:
         if not torch.cuda.is_available():
             return _FLASH_MIN_SEQ_DEFAULT
@@ -289,12 +237,10 @@ def _resolve_flash_min_seq() -> int:
     return _FLASH_MIN_SEQ_BY_CC.get(cc, _FLASH_MIN_SEQ_DEFAULT)
 
 
-# Resolved once for this process's GPU (the device is fixed per process). Read by
-# both dispatch sites (`attention` here, `forward._resolve_eager_backend`).
 FLASH_MIN_SEQ = _resolve_flash_min_seq()
 
 
-_flash_attn = None  # cached (func, varlen_func, kind) where kind in {"cute", "compiled"}
+_flash_attn = None  # cached (func, varlen_func, kind), kind in {"cute", "compiled"}
 
 
 def _import_cute_flash():
@@ -316,18 +262,11 @@ def _import_compiled_flash():
 
 
 def _load_flash_attn():
-    """Resolve the flash kernel for *this* GPU, lazily (so the default sdpa path
-    stays dependency-free) and cached. The right kernel is arch-dependent:
-
-    - sm_90 / sm_100 (Hopper / datacenter Blackwell): CuteDSL **FA4**
-      (`pip install flash-attn-4`), the per-arch SOTA, built on wgmma / tcgen05.
-    - sm_120 (consumer Blackwell): FA4-cute has no kernel (no tcgen05), so the
-      **compiled** flash-attn FA2 path (`pip install flash-attn`, runs from PTX).
-
-    Tries the arch-appropriate kernel first, then the other, and raises only if
-    neither imports. Returns `(func, varlen_func, kind)`; `kind` selects the call
-    ABI (the cute and compiled funcs differ); `varlen_func` is the packed
-    padded-batch entry point (`flash_attention_varlen`)."""
+    """Resolve and cache the flash kernel for this GPU, lazily (so the default sdpa
+    path stays dependency-free). Arch-dependent: cute FA4 on sm_90/sm_100 (no sm_120
+    kernel — no tcgen05), compiled flash-attn FA2 on sm_120. Tries the arch-appropriate
+    one first, then the other; raises only if neither imports. `kind` selects the call
+    ABI (cute and compiled funcs differ)."""
     global _flash_attn
     if _flash_attn is not None:
         return _flash_attn
@@ -354,22 +293,16 @@ def _load_flash_attn():
 
 
 def flash_attention(q, k, v, window, scaling):
-    """FlashAttention with the layer's *structure* (window) instead of a dense
-    mask: full attention (global layers) is `window=(-1, -1)`, and `window=(w, w)`
-    is a symmetric sliding band `|i - j| <= w` (local layers), which FA prunes to
-    the band rather than computing the full `S×S` — the long-S win.
+    """FlashAttention with the layer's window instead of a dense mask: `(-1, -1)` full
+    (global layers), `(w, w)` the symmetric sliding band `|i-j| <= w` (local layers),
+    which FA prunes rather than computing the full `S×S` — the long-S win. Assumes an
+    unpadded batch (padding goes through `flash_attention_varlen`).
 
-    q/k/v arrive as the [B, H, S, D] transpose views the rest of the tail uses;
-    FA wants [B, S, H, D]. The `.transpose(1, 2)` back is a free view — and FA
-    only requires the head dim (last) to be contiguous, which it is (RoPE outputs
-    contiguous [B, H, S, D], and v's unbind view keeps D packed), so we pass the
-    strided views directly with no copy. Assumes an unpadded batch — padding would
-    need `flash_attn_varlen_func` with cu_seqlens; sdpa remains the path for that.
-
-    The cute (FA4) and compiled (FA2) `flash_attn_func` differ in ABI: compiled
-    takes `dropout_p` and spells full attention `(-1, -1)`; cute takes neither,
-    spells it `(None, None)`, and returns `(out, lse)`. `_load_flash_attn` reports
-    which kind loaded, and we adapt the call accordingly.
+    q/k/v arrive as [B, H, S, D] transpose views; the `.transpose(1, 2)` to FA's
+    [B, S, H, D] is a free view (only the head dim must be contiguous, which it is).
+    The cute (FA4) and compiled (FA2) ABIs differ: compiled takes `dropout_p` and
+    spells full attention `(-1, -1)`; cute takes neither, spells it `(None, None)`,
+    and returns `(out, lse)`.
     """
     func, _varlen, kind = _load_flash_attn()
     qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -388,24 +321,12 @@ def flash_attention(q, k, v, window, scaling):
 
 
 def flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling):
-    """FlashAttention over a **packed, variable-length** batch — the path for
-    padded document batches (different lengths padded to a common `S`).
-
-    The encoder runs the whole forward as a single `b=1` sequence of `total`
-    concatenated real tokens (padding already stripped, see `forward._unpad`), so
-    q/k/v arrive as the `[1, H, total, D]` transpose views the rest of the tail
-    uses. `flash_attn_varlen_func` wants `[total, H, D]` plus `cu_seqlens` (the
-    per-sequence boundaries) so it confines attention to within each sequence — no
-    cross-document leakage, and no `S×S` mask. `.squeeze(0).transpose(0, 1)` is a
-    free view; FA only needs the head dim (last) contiguous, which holds.
-
-    `window` is the same per-layer structure as the dense path: `(-1, -1)` full
-    (global layers), `(half, half)` the symmetric sliding band (local layers).
-    Under varlen the band is measured *within* each sequence (FA aligns it to
-    each sub-sequence's own positions), exactly the local-attention semantics.
-
-    Returns `[1, total, hidden]` to match the dense attention's `[b, s, hidden]`
-    so the surrounding layer code (residual add, Wo) is identical."""
+    """FlashAttention over a packed, variable-length batch (padding stripped, see
+    `forward._unpad`). q/k/v arrive as `[1, H, total, D]` views; `flash_attn_varlen_func`
+    wants `[total, H, D]` plus `cu_seqlens` so it confines attention within each
+    sequence (no cross-document leak, no `S×S` mask). `window` is the same per-layer
+    structure as the dense path. Returns `[1, total, hidden]` so the layer code is
+    identical to the dense path."""
     _dense, func, kind = _load_flash_attn()
     qt = q.squeeze(0).transpose(0, 1)  # [1,H,total,D] -> [total,H,D] (view)
     kt = k.squeeze(0).transpose(0, 1)
@@ -432,21 +353,12 @@ def flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling):
 
 
 def attention(q, k, v, *, mask, window, scaling, backend, cu_seqlens=None, max_seqlen=None):
-    """Dispatch attention to the selected backend. `mask` feeds sdpa; `window`
-    feeds flash; both are precomputed per layer so this stays a thin switch.
-
-    When `cu_seqlens` is supplied (the packed varlen path, decided once at the
-    forward level — see `forward._varlen_forward`), the flash backend routes to
-    `flash_attention_varlen`; the dense flash/sdpa kernels are for the
-    rectangular `[B, S]` path.
-
-    `"auto"` resolves per call from `q`'s sequence length: flash for `S >=
-    FLASH_MIN_SEQ` (long-S docs, where windowed pruning wins on every arch) and
-    sdpa below (short-S queries, where flash is pure fixed-cost overhead and sdpa
-    wins or ties). Resolving here — at the leaf, where S is known — means a
-    captured graph bakes in the right path per `(B, S)` bucket. `"auto"` assumes a
-    flash kernel is loadable; `prepare()` downgrades it to `"sdpa"` up front when
-    none is, so this never imports mid-capture."""
+    """Dispatch attention to the selected backend (`mask` feeds sdpa, `window` feeds
+    flash). `cu_seqlens` routes flash to the varlen path. `"auto"` resolves per call
+    from `q`'s sequence length (flash at `S >= FLASH_MIN_SEQ`, else sdpa) — resolving
+    at the leaf lets a captured graph bake in the right path per `(B, S)` bucket.
+    `prepare()` downgrades `"auto"` to `"sdpa"` up front if no kernel is loadable, so
+    this never imports mid-capture."""
     if backend == "auto":
         backend = "flash" if q.shape[2] >= FLASH_MIN_SEQ else "sdpa"
     if backend == "flash":

@@ -1,56 +1,21 @@
 """Skip CuteDSL's ~10 ms per-call dispatch by caching compiled functions.
 
-Calling a `@cute.jit`-decorated launcher pays ~10 ms of host-side dispatch
-on every invocation (arg canonicalization, name mangling, in-memory cache
-lookup, MLIR call-site generation, capi marshaling), even when the cubin is
-already cached. See `project_cutedsl_launch_overhead` memory for the
-profile that established this.
+Calling a `@cute.jit` launcher pays ~10 ms of host-side dispatch on every call, even
+when the cubin is cached. `launcher(*args, compile_only=True)` returns a
+`JitCompiledFunction` whose `__call__` skips that (~7 µs). This module caches those,
+keyed by a caller-declared compilation signature (the baked-in shape dims + dtypes).
 
-`launcher(*args, compile_only=True)` returns a `JitCompiledFunction` whose
-`__call__` skips that pipeline — measured at ~7 µs per call vs ~10 ms.
+`current_cute_stream()` wraps the current PyTorch CUDA stream as a `CUstream` so kernels
+launch on the captured stream during `torch.cuda.graph(...)`. Without it they default to
+the legacy default stream, which graph capture does NOT record — producing silently-wrong
+replay output.
 
-This module caches those precompiled functions, keyed by whatever the
-caller declares as the compilation signature (typically the shape dims
-that get baked into the kernel grid + the input dtypes).
-
-Cache miss = one slow `compile_only=True` call (~hundreds of ms of compile
-on top of the 10 ms dispatch). Cache hit = ~7 µs.
-
-`current_cute_stream()` returns the current PyTorch CUDA stream wrapped as
-a `cuda_driver.CUstream` so kernels can launch on the captured stream
-during `torch.cuda.graph(...)` capture. Without this, CuteDSL kernels
-default to `CU_STREAM_DEFAULT` (the legacy default stream), which is NOT
-captured by stream-bound graph capture — producing silently-wrong replay
-output (kernels never actually re-execute on replay; surrounding torch ops
-read stale buffer state). This is documented in CuteDSL's own
-`cute/testing.py` benchmark helper.
-
-------------------------------------------------------------------------
-Persistent disk cache (FLASH_MODERNBERT_DSL_CACHE=1) — cross-process compile reuse
-------------------------------------------------------------------------
-The fast `compile_only=True` path has one cost: it forces CuteDSL's
-``no_cache=True`` (dsl.py: "Cache is disabled as user wants to compile
-only"), which disables BOTH the in-memory jit cache AND CuteDSL's built-in
-**disk file cache**. So every fresh `python …` process recompiles every
-kernel from scratch — the dominant credit sink when iterating on the B200
-(ptxas on a heavy tcgen05 kernel is tens of seconds *each*; a bench + smoke
-+ A/B across separate processes pays it 3×).
-
-CuteDSL's disk file cache (at ``$CUTE_DSL_CACHE_DIR``, default
-``$TMPDIR/$USER/cutlass_python_cache``) persists the *compiled* module —
-lowered IR with the cubin embedded — and on reload just re-JIT-links it,
-skipping ptxas entirely. Measured locally: 48.5 s cold compile → 0.36 s on
-a fresh process = 134×. But it only engages on a NORMAL (non-compile_only)
-launcher call, because that's the only path that leaves ``no_cache=False``.
-
-So when ``FLASH_MODERNBERT_DSL_CACHE=1`` we route the FIRST invocation of each kernel
-through the normal call path (engages the disk cache and executes once),
-then capture the resulting compiled ``JitCompiledFunction`` and hand it back
-for all subsequent calls — recovering the ~15 µs fast dispatch. Net effect:
-cross-process ptxas reuse *and* fast dispatch, so it's safe for benches too.
-
-Default OFF: the production fast-dispatch path (`compile_only=True`) is
-completely untouched unless the env var is set.
+Persistent disk cache (`FLASH_MODERNBERT_DSL_CACHE=1`, default off): the `compile_only`
+path forces CuteDSL's `no_cache=True`, disabling its built-in cross-process disk cache,
+so every fresh process recompiles from scratch (tens of seconds of ptxas each). When the
+env var is set, the first call of each kernel routes through the normal path (engaging the
+disk cache and executing once), and we capture the resulting compiled fn for subsequent
+calls — recovering fast dispatch *and* cross-process ptxas reuse. See `_FileCacheDispatch`.
 """
 
 from __future__ import annotations

@@ -1,9 +1,8 @@
 """Find the ModernBERT encoder inside whatever the caller hands `prepare()`.
 
-The same package patches HF `AutoModel`, SentenceTransformers, and PyLate ColBERT
-because all three ultimately hold one `ModernBertModel`. This walks the known
-wrapper shapes to that module and raises on an unknown container rather than
-guessing — a wrong guess would patch the wrong weights.
+HF `AutoModel`, SentenceTransformers, and PyLate ColBERT all ultimately hold one
+`ModernBertModel`. This walks the known wrapper shapes to it and raises on an unknown
+container rather than guessing — a wrong guess would patch the wrong weights.
 """
 
 from __future__ import annotations
