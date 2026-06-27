@@ -175,21 +175,29 @@ def _encoder_layer(
     else:
         qkv = ops.ln_linear(x, layer.attn.Wqkv.weight, attn_norm.weight, attn_norm.eps)
 
-    qkv = qkv.view(b, s, 3, h, d)
-    q, k, v = qkv.unbind(dim=2)
-    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-    q, k = ops.fused_apply_rope(q, k, cos, sin)
-    ctx = ops.attention(
-        q,
-        k,
-        v,
-        mask=mask,
-        window=window,
-        scaling=params.scaling,
-        backend=backend,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-    )
+    if ops.use_bshd_rope_flash(backend, s, h, d, cu_seqlens):
+        # Inference flash fast path: RoPE reads the packed qkv and hands flash its native
+        # [.., S, H, D] layout — no transpose to [B,H,S,D], no .contiguous() copy.
+        ctx = ops.flash_attention_qkv_bshd(
+            qkv, h, d, cos=cos, sin=sin, window=window, scaling=params.scaling,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+        )
+    else:
+        qkv = qkv.view(b, s, 3, h, d)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        q, k = ops.fused_apply_rope(q, k, cos, sin)
+        ctx = ops.attention(
+            q,
+            k,
+            v,
+            mask=mask,
+            window=window,
+            scaling=params.scaling,
+            backend=backend,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
     x = x + F.linear(ctx, layer.attn.Wo.weight, None)
 
     mlp_norm = layer.mlp_norm

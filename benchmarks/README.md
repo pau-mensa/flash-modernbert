@@ -395,6 +395,59 @@ memory is equal-or-lower than sdpa. On padded batches flash went from **cosine 0
 `tests/test_varlen.py`. The varlen path is eager-only (graphs stay the short-S sdpa
 feature). `uv run benchmarks/varlen_bench.py`.
 
+#### varlen in TRAINING — packing skips pad-token FLOPs in the backward too (`varlen_train_bench.py`)
+
+The packed path is **not inference-only**: a grad-enabled forward with a padded batch and
+the flash backend routes through `_varlen_forward`, whose ops (unpad/repad, the fused-tail
+autograd Functions, `flash_attn_varlen_func`) all have a backward. So on a skewed-length
+training corpus, packing skips pad-token compute in *both directions* — a FLOP win in the
+backward, not just bandwidth. The packed-training backward is verified to match the dense
+paths on output-proximate grads (>0.998 vs both the sdpa fused tail and stock HF;
+`tests/test_varlen.py::test_varlen_flash_backward_matches_dense` — deep early-layer grads
+are bf16-cancellation noise and not a usable gauge, so the check is on the last layers +
+final norm, which still exercise the whole repad + varlen-attention backward chain).
+
+Measured fwd+bwd (5090, ModernBERT-base, bf16, B8, `varlen_train_bench.py`):
+
+| S (lengths in [0.5S,S]) | flash/sdpa | flash/stock | | S=1024 padding | flash/sdpa | flash/stock |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256  | 1.18× | 1.45× | | none (frac 1.0) | 1.26× | 1.55× |
+| 512  | 1.42× | 1.73× | | frac 0.75       | 1.52× | 1.83× |
+| 1024 | 1.75× | 2.05× | | frac 0.50       | 1.89× | 2.25× |
+| 2048 | 2.21× | 2.66× | | frac 0.10       | 1.96× | 2.31× |
+
+The win grows with both S and padding (up to **2.21× vs our own dense sdpa tail / 2.66× vs
+stock** at S=2048), and reserved memory is **lower** too (e.g. S=2048: 10289 vs 10867 MB) —
+packing drops the pad-token activations. At no padding (frac 1.0) the 1.26× is pure
+windowed-attention pruning, not packing. This is the long-doc *training* lever for F1.
+`uv run benchmarks/varlen_train_bench.py`.
+
+#### BSHD RoPE — fused rope+flash, no layout churn (`bshd_rope_bench.py`)
+
+The dense flash path used to transpose q/k/v to `[B,H,S,D]`, `.contiguous()`-copy q/k for
+the `[B*H,S,D]` RoPE kernel, then transpose back — ~4× the q/k tensor's HBM traffic in pure
+layout churn. `apply_rope_bshd` reads RoPE straight out of the packed qkv (the Wqkv GEMM
+output) and hands flash its native `[.., S, H, D]` layout (≈2× traffic, no transpose, no
+copy; `ops.flash_attention_qkv_bshd`). It's **bit-identical** (same RoPE math → output
+cosine 1.00000), so it only trades speed; the win is bandwidth-bound, growing with S
+(5090, B8 — `infer(fwd)` column of `bshd_rope_bench.py`):
+
+| S | dense flash/off | padded(varlen) flash/off |
+| --- | --- | --- |
+| 512  | 1.07× | 1.05× |
+| 1024 | 1.05× | 1.06× |
+| 2048 | 1.06× | 1.06× |
+| 4096 | 1.07× | 1.08× |
+
+**Inference only — a measured decision, not a missing feature.** A BSHD RoPE backward was
+built and measured; training (fwd+bwd) came out a **wash-to-regression** (5090: 0.81–1.01×
+— the bwd scatters a full `[N,3HD]` grad and autograd must sum it with the attention bwd's
+grad on the v slice, more than the transpose path's single cat), so it was removed and the
+path is gated to no-grad (training keeps the transpose+rope path, where packing dominates).
+No env var; falls back automatically for unsupported `(H, D)`. Larger inference win expected
+on the low-HBM deploy cards (L40S / A100). `uv run benchmarks/bshd_rope_bench.py` (reports
+both `infer(fwd)` and `train(fwd+bwd)` A/B).
+
 Configs: `inference_short.yml` (classic ColBERT Q≈32 / D≈300 — also the roadmap's
 C3 short-S config) and `inference_indexing.yml` (long documents). Both take a
 `graph:` block (`pad_to`, `max_batch`, `seq_buckets`, `max_graphs`) and run on raw

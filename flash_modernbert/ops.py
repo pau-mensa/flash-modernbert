@@ -21,7 +21,11 @@ from flash_modernbert._kernels.layer_norm import (
     layer_norm_with_stats as _ln_kernel_with_stats,
 )
 from flash_modernbert._kernels.ln_bwd_inplace import ln_bwd as _ln_bwd_dyn_kernel
-from flash_modernbert._kernels.rope import apply_rope as _rope_kernel
+from flash_modernbert._kernels.rope import (
+    apply_rope as _rope_kernel,
+    apply_rope_bshd as _rope_bshd_kernel,
+    _bshd_applicable,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +354,58 @@ def flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling):
         )
     total = out.shape[0]
     return out.reshape(1, total, -1)
+
+
+def use_bshd_rope_flash(backend, seq_len, h, d, cu_seqlens) -> bool:
+    """Whether to take the fused BSHD rope+flash path: the flash backend, a supported
+    `(H, D)` (warp-packable), and **no autograd**. The no-grad gate is a *measured*
+    dispatch decision, not laziness: BSHD is a clean inference win (bit-identical,
+    1.05–1.08× fwd, growing with S), but in training (fwd+bwd) it is a wash-to-regression
+    — a BSHD RoPE backward must scatter a full `[N,3HD]` grad and have autograd sum it with
+    the attention backward's grad on the v slice, which costs more than the transpose
+    path's single cat (5090: 0.81–1.01× fwd+bwd, see `benchmarks/bshd_rope_bench.py`). So
+    training keeps the transpose+rope path (where sequence packing already dominates), and
+    BSHD is wired where it actually pays. `"auto"` resolves to flash by the same S /
+    cu_seqlens rule as `attention`; `_bshd_applicable` is a pure capability check
+    (unsupported shapes fall back to transpose+rope), not a toggle."""
+    if torch.is_grad_enabled() or not _bshd_applicable(h, d):
+        return False
+    if backend == "flash":
+        return True
+    if backend == "auto":
+        return cu_seqlens is not None or seq_len >= FLASH_MIN_SEQ
+    return False
+
+
+def flash_attention_qkv_bshd(
+    qkv, h, d, *, cos, sin, window, scaling, cu_seqlens=None, max_seqlen=None
+):
+    """Fused BSHD RoPE + FlashAttention reading the packed `qkv` `[.., S, 3*H*D]`
+    directly. RoPE'd q/k come out contiguous `[.., S, H, D]` and v is the qkv slice (D
+    contiguous) — all in flash's native layout, so there is **no transpose to [B,H,S,D]
+    and no `.contiguous()` copy** (the transpose path pays both: q/k strided→contiguous,
+    then flash transposes back). `cu_seqlens` selects the packed varlen kernel. Returns
+    `[.., S, hidden]`. No-grad only (see `use_bshd_rope_flash` — training is a wash)."""
+    q, k = _rope_bshd_kernel(qkv, h, d, cos, sin)            # contiguous [.., S, H, D]
+    v = qkv.view(*qkv.shape[:-1], 3, h, d)[..., 2, :, :]     # [.., S, H, D] (D contiguous)
+    func, varlen, kind = _load_flash_attn()
+    cute = kind == "cute"
+    w = ((None, None) if window == (-1, -1) else window) if cute else window
+    if cu_seqlens is not None:
+        qf, kf, vf = q.squeeze(0), k.squeeze(0), v.squeeze(0)  # [total, H, D]
+        kw = dict(cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                  max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                  softmax_scale=scaling, causal=False, window_size=w)
+        out = varlen(qf, kf, vf, **(kw if cute else {**kw, "dropout_p": 0.0}))
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return out.reshape(1, out.shape[0], -1)
+    kw = dict(softmax_scale=scaling, causal=False, window_size=w)
+    out = func(q, k, v, **(kw if cute else {**kw, "dropout_p": 0.0}))
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    b, s = out.shape[:2]
+    return out.reshape(b, s, -1)
 
 
 def attention(q, k, v, *, mask, window, scaling, backend, cu_seqlens=None, max_seqlen=None):

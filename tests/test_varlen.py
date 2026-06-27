@@ -159,6 +159,110 @@ def test_varlen_flash_matches_hf_on_padded_batch(models, texts):
     assert _masked_cos(out_flash, out_sdpa, am) > 0.997
 
 
+def _grad_cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    return F.cosine_similarity(a.flatten().float(), b.flatten().float(), dim=0).item()
+
+
+def _grads_of_interest(model) -> dict[str, torch.Tensor]:
+    """Output-proximate param grads: the last three encoder layers' attention / MLP /
+    norm weights plus the final norm. Deep early-layer grads are *not* a usable fidelity
+    gauge in bf16 — they are cancellation-dominated, so even two correct paths (stock HF
+    vs our sdpa) agree only ~0.5 there. The output-proximate grads are well-conditioned
+    (>0.999 between any two correct paths) and still exercise the whole chain a packing
+    bug would corrupt: loss -> repad -> last layers' attention + MLP + LN backward ->
+    varlen-attention backward."""
+    n = len(model.layers)
+    picks = {"final_norm": model.final_norm.weight}
+    for li in (n - 1, n - 2, n - 3):
+        L = model.layers[li]
+        picks[f"L{li}.attn.Wqkv"] = L.attn.Wqkv.weight
+        picks[f"L{li}.attn.Wo"] = L.attn.Wo.weight
+        picks[f"L{li}.mlp.Wi"] = L.mlp.Wi.weight
+        picks[f"L{li}.mlp.Wo"] = L.mlp.Wo.weight
+        picks[f"L{li}.mlp_norm"] = L.mlp_norm.weight
+    return {k: p.grad.detach().clone() for k, p in picks.items()}
+
+
+def _fwd_bwd_grads(model, ids, am) -> dict[str, torch.Tensor]:
+    """One fwd+bwd under a deterministic, signal-rich loss (sum of squared real-token
+    activations). A random output seed leaves early-layer grads cancellation-dominated
+    and bf16-noisy; the squared-norm loss conditions grads at every depth so the
+    comparison reflects the kernels, not rounding in a near-zero quantity. Pads are
+    masked out, so the packed and dense paths see identical signal."""
+    model.zero_grad(set_to_none=True)
+    out = model(input_ids=ids, attention_mask=am).last_hidden_state
+    loss = (out.float().pow(2) * am.unsqueeze(-1)).sum()
+    loss.backward()
+    return _grads_of_interest(model)
+
+
+# Distinct, graded-length sentences (no repetition — repeated tokens make the
+# embedding-table grad a near-total-cancellation noise blob for *every* path).
+_SENTENCES = [
+    "Dense retrieval maps a passage to a single vector.",
+    "A bi-encoder pools all token states into one passage embedding for search.",
+    "Late interaction keeps one contextual vector per token and defers the comparison.",
+    "ColBERT scores a query against a passage by summing, over query tokens, the "
+    "largest similarity to any passage token, which rescues exact-match signal.",
+    "Sliding-window attention reads long documents at linear cost by restricting most "
+    "layers to a local band while a few global layers mix the whole sequence.",
+    "Agentic retrieval issues many reformulated queries over long technical documents, "
+    "so the encoder must stay fast and memory-frugal as passages stretch to thousands "
+    "of tokens, which is exactly where padding waste would otherwise dominate the bill.",
+]
+
+
+def _join(*idx) -> str:
+    return " ".join(_SENTENCES[i] for i in idx)
+
+
+@needs_flash
+@pytest.mark.parametrize(
+    "texts",
+    [
+        # graded-length docs (joined sentences) → heavy, varied padding
+        [_SENTENCES[0], _join(1, 2), _join(3, 4), _join(5, 3, 0)],
+        # six single sentences of differing length
+        list(_SENTENCES),
+    ],
+)
+def test_varlen_flash_backward_matches_dense(models, texts):
+    """The packed (varlen) training backward must be as correct as the dense paths.
+
+    Both checks are on output-proximate grads (see `_grads_of_interest`): packed agrees
+    with the sdpa fused tail (same kernels but attention — isolates pack/unpack + varlen
+    backward) and with stock HF (the ground truth), to >0.998. A structural packing bug
+    — cross-sequence attention leak, wrong RoPE positions, mis-scattered repad grad —
+    would corrupt these by a wide margin (the dense control sits at 0.9999)."""
+    tok, stock, flash, sdpa = models
+    enc = tok(texts, return_tensors="pt", padding="longest")
+    ids = enc["input_ids"].cuda()
+    am = enc["attention_mask"].cuda()
+    assert not bool((am == 1).all()), "batch must have padding to exercise the packed path"
+
+    # Confirm the packed path actually fired for the flash model.
+    calls = {"varlen": 0}
+    orig = forward._varlen_forward
+
+    def spy(*a, **k):
+        calls["varlen"] += 1
+        return orig(*a, **k)
+
+    import unittest.mock as _m
+    with _m.patch.object(forward, "_varlen_forward", spy):
+        g_flash = _fwd_bwd_grads(flash, ids, am)
+    assert calls["varlen"] == 1, "flash backend did not route through the packed path"
+
+    g_sdpa = _fwd_bwd_grads(sdpa, ids, am)
+    g_stock = _fwd_bwd_grads(stock, ids, am)
+
+    for name in g_flash:
+        flash_sdpa = _grad_cos(g_flash[name], g_sdpa[name])
+        flash_hf = _grad_cos(g_flash[name], g_stock[name])
+        assert flash_sdpa > 0.998, f"{name}: packed-vs-sdpa grad cos {flash_sdpa:.5f}"
+        assert flash_hf > 0.998, f"{name}: packed-vs-HF grad cos {flash_hf:.5f}"
+
+
 @needs_flash
 def test_varlen_only_engages_when_padded(monkeypatch, models):
     """A genuinely unpadded (all-ones) batch must take the dense flash path, not

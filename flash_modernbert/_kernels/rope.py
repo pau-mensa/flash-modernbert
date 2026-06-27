@@ -33,7 +33,7 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32
+from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
 from flash_modernbert._kernels._compile_cache import current_cute_stream, get_compiled
@@ -41,6 +41,7 @@ from flash_modernbert._kernels._compile_cache import current_cute_stream, get_co
 
 VEC = 8                  # 128-bit (8×bf16) coalesced loads/stores
 ROWS_PER_BLOCK = 8       # best on B200 sweep; smaller blocks win (latency-bound)
+WARP_SIZE = 32
 
 
 def _shfl_applicable(d: int) -> bool:
@@ -124,6 +125,99 @@ def _build_shfl_for_d(d: int):
     return launch
 
 
+def _bshd_applicable(h: int, d: int) -> bool:
+    """The BSHD coalesced-shuffle path needs D vec-aligned with a power-of-two chunk
+    count (the partner lane stays inside D via `^ low_chunks`) AND H a multiple of the
+    heads packed per warp, so every head's chunks sit inside one warp. True for the
+    ModernBERT D=64 / H∈{12,16} family."""
+    if not _shfl_applicable(d):
+        return False
+    chunks_per_head = d // VEC
+    if WARP_SIZE % chunks_per_head != 0:
+        return False
+    heads_per_warp = WARP_SIZE // chunks_per_head
+    return h % heads_per_warp == 0
+
+
+def _build_bshd_for_hd(h: int, d: int):
+    """Coalesced-shuffle RoPE that reads q/k straight out of the **packed qkv**
+    `[N, 3*H*D]` (the fused-Wqkv GEMM output, contiguous) and writes contiguous
+    `[N, H, D]` q_out/k_out — the flash path's layout, with no transpose to [B,H,S,D]
+    and no `.contiguous()` copy (the [B*H,S,D] kernel needs q/k packed-contiguous, which
+    a transpose-view is not). Fusing the q/k slice-extract in also drops the unbind.
+
+    One block owns one token row `bs` (its 3HD run is contiguous → coalesced reads);
+    `pos = bs % s_mod` indexes cos/sin (`s_mod = S` for a dense [B,S,..] batch, or the
+    packed `total` for varlen, where rows map 1:1 to the gathered cos/sin so the modulo
+    is identity). q lives at row offset 0, k at offset H*D. The low/high D pairing is
+    resolved by an intra-warp butterfly shuffle as in the [B*H,S,D] kernel; heads are
+    packed `WARP_SIZE//chunks` per warp so a head's partner lane never crosses a warp."""
+    hd = h * d
+    half_d = d // 2
+    chunks_per_head = d // VEC          # 8 for D=64
+    low_chunks = half_d // VEC          # 4 -> partner lane = tidx ^ low_chunks
+    threads = h * chunks_per_head       # all heads of one row, e.g. 96 for H=12,D=64
+
+    @cute.kernel
+    def kernel(
+        gqkv: cute.Tensor,  # [N, 3*H*D]  (N = B*S dense, or total varlen)
+        gcos: cute.Tensor,  # [s_mod, D]
+        gsin: cute.Tensor,
+        gq_out: cute.Tensor,  # [N, H, D]
+        gk_out: cute.Tensor,
+        s_mod: cutlass.Int32,
+    ):
+        bs, _, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        dt = gqkv.element_type
+        head = tidx // chunks_per_head
+        chunk = tidx % chunks_per_head
+        pos = bs % s_mod
+        d0 = chunk * VEC
+        row_in = cute.crd2idx((bs, head * d + d0), gqkv.layout)   # q at offset 0
+        i_out = cute.crd2idx((bs, head, d0), gq_out.layout)
+        i_c = cute.crd2idx((pos, d0), gcos.layout)
+        cv = cute.make_rmem_tensor((VEC,), dt)
+        sv = cute.make_rmem_tensor((VEC,), dt)
+        cute.autovec_copy(cute.make_tensor(gcos.iterator + i_c, cute.make_layout(VEC)), cv)
+        cute.autovec_copy(cute.make_tensor(gsin.iterator + i_c, cute.make_layout(VEC)), sv)
+        sign = Float32(1.0)
+        if chunk < low_chunks:
+            sign = Float32(-1.0)
+        for (in_off, gout) in ((0, gq_out), (hd, gk_out)):
+            mine = cute.make_rmem_tensor((VEC,), dt)
+            out = cute.make_rmem_tensor((VEC,), dt)
+            cute.autovec_copy(
+                cute.make_tensor(gqkv.iterator + row_in + in_off, cute.make_layout(VEC)), mine)
+            for j in cutlass.range_constexpr(VEC):
+                myf = mine[j].to(Float32)
+                pf = cute.arch.shuffle_sync_bfly(
+                    myf, offset=low_chunks, mask=-1, mask_and_clamp=WARP_SIZE - 1)
+                out[j] = out.element_type(
+                    myf * cv[j].to(Float32) + sign * pf * sv[j].to(Float32))
+            cute.autovec_copy(
+                out, cute.make_tensor(gout.iterator + i_out, cute.make_layout(VEC)))
+
+    @cute.jit
+    def launch(
+        qkv: cute.Tensor,
+        cos: cute.Tensor,
+        sin: cute.Tensor,
+        q_out: cute.Tensor,
+        k_out: cute.Tensor,
+        s_mod: cutlass.Int32,
+        stream: cuda_driver.CUstream,
+    ):
+        n = cute.size(qkv, mode=[0])
+        kernel(qkv, cos, sin, q_out, k_out, s_mod).launch(
+            grid=(n, 1, 1),
+            block=(threads, 1, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
 def _build_scalar_for_d(d: int):
     """Scalar fallback for head_dims the shuffle path can't take (D not a
     power-of-two multiple of VEC). One block per (b,h,s); thread `t` owns the
@@ -188,6 +282,7 @@ def _build_scalar_for_d(d: int):
 
 
 _compiled_for_d: dict[tuple[int, bool], object] = {}
+_compiled_bshd: dict[tuple[int, int], object] = {}
 
 
 def _get_jit(d: int, shfl: bool):
@@ -195,6 +290,63 @@ def _get_jit(d: int, shfl: bool):
     if key not in _compiled_for_d:
         _compiled_for_d[key] = _build_shfl_for_d(d) if shfl else _build_scalar_for_d(d)
     return _compiled_for_d[key]
+
+
+def _get_jit_bshd(h: int, d: int):
+    key = (h, d)
+    if key not in _compiled_bshd:
+        _compiled_bshd[key] = _build_bshd_for_hd(h, d)
+    return _compiled_bshd[key]
+
+
+def apply_rope_bshd(
+    qkv: torch.Tensor,
+    h: int,
+    d: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RoPE'd q, k extracted straight from the packed **qkv** `[..., 3*H*D]` (the fused
+    Wqkv GEMM output) in the flash path's [..., H, D] layout — no transpose to [B,H,S,D]
+    and no `.contiguous()` copy (the [B*H,S,D] kernel needs packed-contiguous q/k, which
+    a transpose-view is not), and the q/k slice-extract is fused in.
+
+    `qkv`: [..., 3*H*D], contiguous in the last dim (leading dims flattened to N rows).
+    `cos`, `sin`: the position tables — dense `[S, D]` (or `[1, S, D]`), or the varlen
+    per-token gathered `[total, D]`; `s_mod` (rows of cos) is derived, so dense uses
+    `pos = bs % S` and varlen `pos = bs` (identity). Returns contiguous q, k of shape
+    `qkv.shape[:-1] + (H, D)`. Requires `_bshd_applicable(H, D)`."""
+    assert qkv.is_cuda and cos.is_cuda and sin.is_cuda
+    assert qkv.dtype == cos.dtype == sin.dtype
+    assert qkv.shape[-1] == 3 * h * d, f"qkv last dim {qkv.shape[-1]} != 3*{h}*{d}"
+    assert _bshd_applicable(h, d), f"BSHD rope unsupported for H={h}, D={d}"
+    if cos.ndim == 3:  # [1, s_mod, D] -> [s_mod, D]
+        cos, sin = cos[0], sin[0]
+    s_mod = cos.shape[0]
+    assert cos.shape == (s_mod, d), f"cos {tuple(cos.shape)} != ({s_mod}, {d})"
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+
+    qkv_f = qkv.reshape(-1, 3 * h * d)   # contiguous view of the GEMM output
+    n = qkv_f.shape[0]
+    out_shape = tuple(qkv.shape[:-1]) + (h, d)
+    q_out = torch.empty(n, h, d, dtype=qkv.dtype, device=qkv.device)
+    k_out = torch.empty(n, h, d, dtype=qkv.dtype, device=qkv.device)
+
+    launcher = _get_jit_bshd(h, d)
+    args = (
+        from_dlpack(qkv_f, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+        from_dlpack(cos, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+        from_dlpack(sin, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+        from_dlpack(q_out, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+        from_dlpack(k_out, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+        Int32(s_mod),
+        current_cute_stream(),
+    )
+    # N is a runtime grid dim; H/D are baked in the closure. One artifact per (H, D).
+    compiled = get_compiled(launcher, args, key=(qkv.dtype, h, d))
+    compiled(*args)
+    return q_out.view(out_shape), k_out.view(out_shape)
 
 
 def apply_rope(
