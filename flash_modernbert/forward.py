@@ -300,22 +300,37 @@ def _repad(x_packed: Tensor, indices: Tensor, b: int, s: int) -> Tensor:
     return out.reshape(b, s, hidden)
 
 
-def _varlen_forward(
+def packed_forward(
     model: nn.Module,
     params: ModernBertParams,
-    input_ids: Tensor,
-    attention_mask: Tensor,
+    packed_ids: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    position_ids: Tensor,
 ) -> Tensor:
-    """Run the encoder on the packed (unpadded) batch as a single `b=1` sequence,
-    then re-pad. `core` runs unchanged — only attention takes `cu_seqlens` (confining
-    it within each original sequence) and RoPE takes per-token-gathered cos/sin."""
-    b, s = input_ids.shape
-    device = input_ids.device
-    # Unpad ids first (treat [B, S] as [B, S, 1] so _unpad's index math is reused).
-    packed_ids, indices, cu_seqlens, max_seqlen, position_ids = _unpad(
-        input_ids.unsqueeze(-1), attention_mask
-    )
-    packed_ids = packed_ids.squeeze(-1)
+    """Run the encoder on an *already-packed* batch; return packed `[total, H]`.
+
+    The packed-paradigm entry: `_varlen_forward` **minus its two padding-boundary ops**
+    — no `_unpad` of an incoming `[B, S]` batch (the caller's collator already packed it)
+    and no `_repad` of the result (it stays `[total, H]` for a packed loss). `core` runs
+    unchanged: attention takes `cu_seqlens` (confining it within each sequence) and RoPE
+    takes per-token-gathered cos/sin.
+
+    Args:
+        packed_ids: real token ids `[total]`, all sequences concatenated.
+        cu_seqlens: `[n_seq + 1]` int32 prefix sums of sequence lengths (flash varlen).
+        max_seqlen: longest sequence length (bounds the RoPE table).
+        position_ids: `[total]` within-sequence index per token (0,1,2,… per sequence).
+            Must match HF's `arange`-per-position convention (identical to `_unpad`'s
+            `indices % S` for right-padded data) or RoPE positions — and any
+            padded-vs-packed parity — break.
+
+    Additive and non-breaking: the shipped `[B, S]` HF forward is untouched; this is an
+    explicit opt-into-the-paradigm call. Flash backend only (packing *is* the flash
+    varlen kernel). Slightly cheaper than `_varlen_forward` too — no `index_select` /
+    `index_copy` padding round-trip.
+    """
+    device = packed_ids.device
 
     # Embed only the real tokens.
     emb = model.embeddings.tok_embeddings(packed_ids)
@@ -353,7 +368,27 @@ def _varlen_forward(
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
     )
-    return _repad(out.squeeze(0), indices, b, s)
+    return out.squeeze(0)
+
+
+def _varlen_forward(
+    model: nn.Module,
+    params: ModernBertParams,
+    input_ids: Tensor,
+    attention_mask: Tensor,
+) -> Tensor:
+    """Run the encoder on the packed (unpadded) batch as a single `b=1` sequence,
+    then re-pad. Internally: `_unpad` → `packed_forward` → `_repad`, i.e. the packed
+    entry wrapped in the two padding-boundary ops that the patched `[B, S]` forward
+    needs (the showcase's packed path calls `packed_forward` directly and skips both)."""
+    b, s = input_ids.shape
+    # Unpad ids first (treat [B, S] as [B, S, 1] so _unpad's index math is reused).
+    packed_ids, indices, cu_seqlens, max_seqlen, position_ids = _unpad(
+        input_ids.unsqueeze(-1), attention_mask
+    )
+    packed_ids = packed_ids.squeeze(-1)
+    out = packed_forward(model, params, packed_ids, cu_seqlens, max_seqlen, position_ids)
+    return _repad(out, indices, b, s)
 
 
 def fused_forward(

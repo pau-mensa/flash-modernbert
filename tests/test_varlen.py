@@ -264,6 +264,54 @@ def test_varlen_flash_backward_matches_dense(models, texts):
 
 
 @needs_flash
+@pytest.mark.parametrize(
+    "texts",
+    [
+        ["short doc.", "a considerably longer document with many more tokens than the first one here ok then"],
+        [_SENTENCES[0], _join(1, 2), _join(3, 4), _join(5, 3, 0)],
+        ["only one sequence in this batch, no other rows to pad against at all"],
+    ],
+)
+def test_packed_forward_entry_matches_hf(models, texts):
+    """The additive packed entry (`forward.packed_forward`) — the showcase's paradigm
+    path, which bypasses the patched `[B, S]` forward and consumes already-packed input
+    — must match stock HF on the real tokens. Builds the packed input the way a collator
+    will (real ids, `cu_seqlens`, per-sequence within-seq positions) and feeds it straight
+    to `packed_forward`, returning `[total, H]` (no repad). This is the P0 forward-parity
+    gate for the packed-paradigm showcase: loss-curve parity follows from it."""
+    from flash_modernbert.config import ModernBertParams
+    from flash_modernbert.locate import find_encoder
+
+    tok, stock, flash, sdpa = models
+    enc = tok(texts, return_tensors="pt", padding="longest")
+    ids = enc["input_ids"].cuda()
+    am = enc["attention_mask"].cuda()
+    b, s = ids.shape
+
+    # packed_forward reads weights straight off the live module — no prepare() needed,
+    # exactly how the showcase opts into the paradigm (the drop-in [B,S] forward is for
+    # padded users; this is the explicit packed call).
+    encoder = find_encoder(stock)
+    params = ModernBertParams.from_hf_config(encoder.config)
+
+    packed_ids, indices, cu_seqlens, max_seqlen, position_ids = forward._unpad(
+        ids.unsqueeze(-1), am
+    )
+    packed_ids = packed_ids.squeeze(-1)
+    with torch.no_grad():
+        packed_out = forward.packed_forward(
+            encoder, params, packed_ids, cu_seqlens, max_seqlen, position_ids
+        )
+        ref = stock(input_ids=ids, attention_mask=am).last_hidden_state
+    assert packed_out.shape == (int(am.sum()), ref.shape[-1])  # [total, H], no repad
+    ref_packed = ref.reshape(b * s, -1).index_select(0, indices)
+    cos = F.cosine_similarity(
+        packed_out.flatten().float(), ref_packed.flatten().float(), dim=0
+    ).item()
+    assert cos > 0.997, f"packed entry vs HF real-token cos {cos:.5f}"
+
+
+@needs_flash
 def test_varlen_only_engages_when_padded(monkeypatch, models):
     """A genuinely unpadded (all-ones) batch must take the dense flash path, not
     varlen — _varlen_forward should fire only when there is padding to strip."""
