@@ -30,15 +30,16 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32
+from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
 from flash_modernbert._kernels._compile_cache import current_cute_stream, get_compiled
 
 WARP_SIZE = 32
 NUM_WARPS = 8
-NUM_THREADS = NUM_WARPS * WARP_SIZE   # 256
-BM_BAND = NUM_WARPS                    # one warp per row in the band
+NUM_THREADS = NUM_WARPS * WARP_SIZE  # 256
+BM_BAND = NUM_WARPS  # one warp per row in the band
+
 
 def _build_dyn(k: int, n_sm: int):
     assert k % WARP_SIZE == 0, f"K={k} must be a multiple of warp size {WARP_SIZE}"
@@ -52,13 +53,13 @@ def _build_dyn(k: int, n_sm: int):
 
     @cute.kernel
     def kernel(
-        g_grad_in: cute.Tensor,               # [M, K] bf16  grad wrt LN output
-        g_grad_x: cute.Tensor,                # [M, K] bf16  output (may alias g_grad_in)
-        g_x: cute.Tensor,                     # [M, K] bf16
-        g_mean: cute.Tensor,                  # [M]    fp32
-        g_rstd: cute.Tensor,                  # [M]    fp32
-        g_gamma: cute.Tensor,                 # [K]    bf16
-        g_grad_gamma_partials: cute.Tensor,   # [n_sm, K] fp32
+        g_grad_in: cute.Tensor,  # [M, K] bf16  grad wrt LN output
+        g_grad_x: cute.Tensor,  # [M, K] bf16  output (may alias g_grad_in)
+        g_x: cute.Tensor,  # [M, K] bf16
+        g_mean: cute.Tensor,  # [M]    fp32
+        g_rstd: cute.Tensor,  # [M]    fp32
+        g_gamma: cute.Tensor,  # [K]    bf16
+        g_grad_gamma_partials: cute.Tensor,  # [n_sm, K] fp32
         m: Int32,
     ):
         cta_idx, _, _ = cute.arch.block_idx()
@@ -74,7 +75,8 @@ def _build_dyn(k: int, n_sm: int):
         for ki in cutlass.range_constexpr(elems_per_thread):
             grad_gamma_acc[ki] = Float32(0.0)
 
-        smem_part_ptr = cute.arch.alloc_smem(Float32, NUM_WARPS * k, alignment=16)
+        # Dynamic SMEM (sized by the `smem=` launch arg below), NOT alloc_smem
+        smem_part_ptr = cute.arch.get_dyn_smem(Float32, alignment=16)
         smem_part = cute.make_tensor(
             smem_part_ptr,
             cute.make_layout((NUM_WARPS, k), stride=(k, 1)),
@@ -109,10 +111,16 @@ def _build_dyn(k: int, n_sm: int):
 
                 for delta in (16, 8, 4, 2, 1):
                     local_c1 = local_c1 + cute.arch.shuffle_sync_bfly(
-                        local_c1, offset=delta, mask=-1, mask_and_clamp=WARP_SIZE - 1,
+                        local_c1,
+                        offset=delta,
+                        mask=-1,
+                        mask_and_clamp=WARP_SIZE - 1,
                     )
                     local_c2 = local_c2 + cute.arch.shuffle_sync_bfly(
-                        local_c2, offset=delta, mask=-1, mask_and_clamp=WARP_SIZE - 1,
+                        local_c2,
+                        offset=delta,
+                        mask=-1,
+                        mask_and_clamp=WARP_SIZE - 1,
                     )
 
                 c1 = local_c1 * Float32(inv_k)
@@ -150,9 +158,7 @@ def _build_dyn(k: int, n_sm: int):
         stream: cuda_driver.CUstream,
     ):
         m = cute.size(X, mode=[0])
-        kernel(
-            GradIn, GradX, X, Mean, Rstd, Gamma, GradGammaPartials, m
-        ).launch(
+        kernel(GradIn, GradX, X, Mean, Rstd, Gamma, GradGammaPartials, m).launch(
             grid=(n_sm, 1, 1),
             block=(NUM_THREADS, 1, 1),
             smem=(NUM_WARPS * k * 4 + 1024) & ~127,
