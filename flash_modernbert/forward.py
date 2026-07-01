@@ -198,12 +198,12 @@ def _encoder_layer(
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-    x = x + F.linear(ctx, layer.attn.Wo.weight, None)
-
+    wo_out = ops._linear(ctx, layer.attn.Wo.weight)
     mlp_norm = layer.mlp_norm
-    x = x + ops.geglu_mlp_pre_ln(
-        x, layer.mlp.Wi.weight, layer.mlp.Wo.weight, mlp_norm.weight, mlp_norm.eps
+    x, normed = ops.fused_add_layer_norm(
+        x, wo_out, mlp_norm.weight, mlp_norm.eps
     )
+    x = x + ops.geglu_mlp(normed, layer.mlp.Wi.weight, layer.mlp.Wo.weight)
     return x
 
 

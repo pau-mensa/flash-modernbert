@@ -98,12 +98,18 @@ def fused_layer_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch
     fp32 master weights under bf16 autocast must still go through the `custom_fwd`
     cast wrapper even in a no-grad pass, so x and gamma are cast to the same dtype
     (the raw kernel requires equal dtypes).
+
+    The inference path (no grad, no autocast) uses a Triton kernel whose dispatch
+    overhead is ~7 µs — lower than the CuTe DSL variant's ~15 µs from_dlpack
+    wrapping. Training stays on CuTe DSL for the backward stats path.
     """
     if torch.is_autocast_enabled("cuda") or (
         torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
     ):
         return _LayerNormFn.apply(x, weight, eps)
-    return _ln_kernel(x.detach(), weight.detach(), eps)
+    from flash_modernbert._kernels.triton_layer_norm import layer_norm as _triton_ln
+
+    return _triton_ln(x.detach(), weight.detach(), eps)
 
 
 # ---------------------------------------------------------------------------
@@ -173,21 +179,56 @@ class _GegluFn(torch.autograd.Function):
 def fused_geglu(proj, *, out_dtype=None):
     if torch.is_grad_enabled() and proj.requires_grad:
         return _GegluFn.apply(proj, out_dtype)
-    return _geglu_kernel(proj.detach(), out_dtype=out_dtype)
+    from flash_modernbert._kernels.triton_layer_norm import geglu as _triton_geglu
+
+    return _triton_geglu(proj.detach())
 
 
 # ---------------------------------------------------------------------------
 # Composite layer ops (cuBLAS GEMMs + the tails above)
 # ---------------------------------------------------------------------------
 
+_TRITON_MM_MAX_ROWS = 4096
+
+
+def _linear(x, weight):
+    n = x.shape[0] if x.ndim == 2 else x.shape[0] * x.shape[1]
+    if (
+        not torch.is_grad_enabled()
+        and n <= _TRITON_MM_MAX_ROWS
+        and x.dtype == weight.dtype
+    ):
+        from flash_modernbert._kernels.matmul import triton_linear
+
+        return triton_linear(x, weight)
+    return F.linear(x, weight, None)
+
+
+def fused_add_layer_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused ``x_new = x + residual; y = LN(x_new)`` → ``(x_new, y)``."""
+    if torch.is_grad_enabled() and (x.requires_grad or residual.requires_grad):
+        x_new = x + residual
+        return x_new, fused_layer_norm(x_new, weight, eps)
+    from flash_modernbert._kernels.triton_layer_norm import add_layer_norm
+
+    return add_layer_norm(x.detach(), residual.detach(), weight.detach(), eps)
+
 
 def ln_linear(x, weight, gamma, eps):
-    return F.linear(fused_layer_norm(x, gamma, eps), weight, None)
+    return _linear(fused_layer_norm(x, gamma, eps), weight)
+
+
+def add_ln_linear(x, residual, weight, gamma, eps):
+    """Fused residual-add + LN + linear: ``LN(x + residual) @ W^T``."""
+    x_new, normed = fused_add_layer_norm(x, residual, gamma, eps)
+    return x_new, _linear(normed, weight)
 
 
 def geglu_mlp(x, w_in, w_out):
-    proj = F.linear(x, w_in, None)
-    return F.linear(fused_geglu(proj), w_out, None)
+    proj = _linear(x, w_in)
+    return _linear(fused_geglu(proj), w_out)
 
 
 def geglu_mlp_pre_ln(x, w_in, w_out, gamma, eps):
