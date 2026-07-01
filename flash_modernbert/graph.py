@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from flash_modernbert import forward
+from flash_modernbert import forward, ops
 from flash_modernbert.config import ModernBertParams
 from flash_modernbert.locate import find_encoder
 from flash_modernbert.state import get_state
@@ -196,6 +196,180 @@ class _GraphRunner:
             key = (batch, sb)
             if key not in self._cache:
                 self._insert(key, self._capture(batch, sb))
+
+
+# ---------------------------------------------------------------------------
+# Packed graph runner — captures packed_forward at a fixed token budget
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PackedStaticInputs:
+    """Fixed-address buffers for packed graph replay."""
+    input_ids: Tensor
+    cu_seqlens: Tensor
+    position_ids: Tensor
+    max_seqlen: int
+
+    def stage(
+        self, packed_ids: Tensor, cu_seqlens: Tensor, position_ids: Tensor
+    ) -> int:
+        m_real = packed_ids.shape[0]
+        b_real = cu_seqlens.shape[0] - 1
+        self.input_ids[:m_real].copy_(packed_ids)
+        self.input_ids[m_real:].zero_()
+        self.position_ids[:m_real].copy_(position_ids)
+        self.position_ids[m_real:].zero_()
+        self.cu_seqlens[:b_real + 1].copy_(cu_seqlens)
+        if b_real + 1 < self.cu_seqlens.shape[0]:
+            self.cu_seqlens[b_real + 1 :].fill_(m_real)
+        return m_real
+
+
+@dataclass
+class _PackedCaptured:
+    graph: "torch.cuda.CUDAGraph"
+    inputs: _PackedStaticInputs
+    out: Tensor
+
+
+class _PackedGraphRunner:
+    """Graph runner for ``packed_forward``: one graph per M-bucket.
+
+    The packed tensor shape is ``[1, M, H]`` (batch dim is always 1; sequences
+    are encoded in ``cu_seqlens``).  The graph captures at a fixed ``M_bucket``
+    with ``max_batch`` sequences and ``max_seq`` RoPE range.  Padding tokens
+    beyond the real M are processed (wasted work) but their output is discarded.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        params: ModernBertParams,
+        config: GraphConfig,
+    ):
+        self._model = model
+        self._params = params
+        self._config = config
+        self._device = next(model.parameters()).device
+        self._cache: OrderedDict[int, _PackedCaptured] = OrderedDict()
+
+    def __call__(
+        self,
+        packed_ids: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        position_ids: Tensor,
+    ) -> Tensor:
+        m = packed_ids.shape[0]
+        max_seq = self._config.max_seq
+        if max_seq is not None and max_seqlen > max_seq:
+            return self._eager(packed_ids, cu_seqlens, max_seqlen, position_ids)
+        if m > self._config.max_tokens:
+            return self._eager(packed_ids, cu_seqlens, max_seqlen, position_ids)
+
+        mb = _round_up(m, self._config.pad_to)
+        captured = self._cache.get(mb)
+        if captured is not None:
+            self._cache.move_to_end(mb)
+        else:
+            captured = self._capture(mb)
+            while len(self._cache) >= self._config.max_graphs:
+                self._cache.popitem(last=False)
+            self._cache[mb] = captured
+
+        m_real = captured.inputs.stage(packed_ids, cu_seqlens, position_ids)
+        captured.graph.replay()
+        return captured.out[:m_real].clone()
+
+    def _eager(self, packed_ids, cu_seqlens, max_seqlen, position_ids):
+        return forward.packed_forward(
+            self._model,
+            self._params,
+            packed_ids,
+            cu_seqlens,
+            max_seqlen,
+            position_ids,
+        )
+
+    def _capture(self, mb: int) -> _PackedCaptured:
+        max_seq = self._config.max_seq
+        bb = self._config.max_batch
+        if max_seq is None or bb is None:
+            raise ValueError(
+                "packed graph runner requires both max_seq and max_batch"
+            )
+        static = _PackedStaticInputs(
+            input_ids=torch.zeros(mb, dtype=torch.long, device=self._device),
+            cu_seqlens=torch.zeros(
+                bb + 1, dtype=torch.int32, device=self._device
+            ),
+            position_ids=torch.zeros(
+                mb, dtype=torch.long, device=self._device
+            ),
+            max_seqlen=max_seq,
+        )
+        per_seq = max(1, mb // bb)
+        for i in range(bb):
+            end = min((i + 1) * per_seq, mb)
+            static.cu_seqlens[i + 1] = end
+            start = int(static.cu_seqlens[i])
+            static.position_ids[start:end] = torch.arange(
+                end - start, device=self._device
+            )
+
+        with torch.no_grad():
+            warm = torch.cuda.Stream()
+            warm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warm):
+                for _ in range(self._config.warmup):
+                    self._run_forward(static)
+            torch.cuda.current_stream().wait_stream(warm)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = self._run_forward(static)
+        return _PackedCaptured(graph=graph, inputs=static, out=out)
+
+    def _run_forward(self, static: _PackedStaticInputs) -> Tensor:
+        model, params = self._model, self._params
+        emb = model.embeddings.tok_embeddings(static.input_ids)
+        x = ops.fused_layer_norm(emb, model.embeddings.norm.weight,
+                                 model.embeddings.norm.eps)
+        dtype, device = x.dtype, x.device
+        hd = params.head_dim
+        cos_g, sin_g = forward._rope_tables(
+            static.max_seqlen, hd, params.global_rope_theta, device, dtype
+        )
+        if params.local_rope_theta == params.global_rope_theta:
+            cos_l, sin_l = cos_g, sin_g
+        else:
+            cos_l, sin_l = forward._rope_tables(
+                static.max_seqlen, hd, params.local_rope_theta, device, dtype
+            )
+
+        def gather(t: Tensor) -> Tensor:
+            return t[0].index_select(0, static.position_ids)
+
+        out = forward.core(
+            model, params,
+            x.unsqueeze(0),
+            gather(cos_g), gather(sin_g),
+            gather(cos_l), gather(sin_l),
+            None, None,
+            backend="flash",
+            cu_seqlens=static.cu_seqlens,
+            max_seqlen=static.max_seqlen,
+        )
+        return out.squeeze(0)
+
+
+def build_packed_runner(
+    model: nn.Module, params: ModernBertParams, config: GraphConfig
+) -> _PackedGraphRunner | None:
+    if config.max_batch is None or config.max_seq is None:
+        return None
+    return _PackedGraphRunner(model, params, config)
 
 
 def build_runner(

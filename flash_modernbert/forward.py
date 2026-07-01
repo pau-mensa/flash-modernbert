@@ -7,6 +7,7 @@ tables, SDPA masks) carries a host sync in mask prep so it runs eager; `core`
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -15,6 +16,9 @@ from torch import Tensor, nn
 
 from flash_modernbert import ops
 from flash_modernbert.config import ModernBertParams
+from flash_modernbert.state import ATTR
+
+_GRAPH_ENV = "FLASH_MODERNBERT_GRAPH"
 
 
 @dataclass(frozen=True)
@@ -316,6 +320,11 @@ def packed_forward(
     unchanged: attention takes `cu_seqlens` (confining it within each sequence) and RoPE
     takes per-token-gathered cos/sin.
 
+    When ``fm.prepare(cuda_graph=...)`` is active, the packed graph runner captures this
+    function at a fixed token budget and replays on subsequent calls, eliminating all
+    per-kernel dispatch overhead.  Falls back to eager when inputs exceed the graph
+    budget or when grad/autocast is enabled.
+
     Args:
         packed_ids: real token ids `[total]`, all sequences concatenated.
         cu_seqlens: `[n_seq + 1]` int32 prefix sums of sequence lengths (flash varlen).
@@ -330,6 +339,18 @@ def packed_forward(
     varlen kernel). Slightly cheaper than `_varlen_forward` too — no `index_select` /
     `index_copy` padding round-trip.
     """
+    state = getattr(model, ATTR, None)
+    if (
+        state is not None
+        and state.packed_graph_runner is not None
+        and os.environ.get(_GRAPH_ENV, "1") != "0"
+        and not torch.is_grad_enabled()
+        and not torch.is_autocast_enabled("cuda")
+    ):
+        return state.packed_graph_runner(
+            packed_ids, cu_seqlens, max_seqlen, position_ids
+        )
+
     device = packed_ids.device
 
     # Embed only the real tokens.

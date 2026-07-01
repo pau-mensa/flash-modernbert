@@ -18,7 +18,7 @@ from flash_modernbert import ops
 from flash_modernbert.config import ModernBertParams
 from flash_modernbert.errors import FlashModernBertError
 from flash_modernbert.forward import fused_forward
-from flash_modernbert.graph import GraphConfig, build_runner, graphs_globally_disabled
+from flash_modernbert.graph import GraphConfig, build_packed_runner, build_runner, graphs_globally_disabled
 from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
 from flash_modernbert.locate import find_encoder
 from flash_modernbert.state import ATTR, PatchState
@@ -149,6 +149,7 @@ def _enable_graphs(
     state.graph_runner = build_runner(
         encoder, state.params, config, backend=state.attention_backend
     )
+    state.packed_graph_runner = build_packed_runner(encoder, state.params, config)
     state.graph_enabled = True
 
 
