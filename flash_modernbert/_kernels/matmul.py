@@ -41,7 +41,7 @@ import triton.language as tl
             num_stages=3, num_warps=4,
         ),
     ],
-    key=["M", "N", "K"],
+    key=["N", "K"],
 )
 @triton.jit
 def _matmul_kernel(
@@ -64,10 +64,12 @@ def _matmul_kernel(
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
+    mask_m = offs_m[:, None] < M
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K, other=0.0)
+        k_mask = offs_k < K
+        a = tl.load(a_ptrs, mask=mask_m & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
