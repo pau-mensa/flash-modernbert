@@ -221,6 +221,7 @@ __marimo__/
 benchmarks/results/
 showcase/results/
 showcase/data_cache/
+showcase/output/
 data_cache/
 
 # lock files

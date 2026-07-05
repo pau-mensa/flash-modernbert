@@ -1,0 +1,30 @@
+# Full single-vector training showcase on B200.
+# Mirrors Agent-ModernColBERT hyperparameters (2 epochs, 7 negatives)
+# but with B=16 to fit in B200 memory at doc_length=2048.
+models:
+  single_vector: Alibaba-NLP/gte-modernbert-base
+  query_length: 128
+  document_length: 2048
+
+dataset:
+  num_groups: 5200
+  num_probe_groups: 16
+  num_negatives: 7
+  query_instruction: "Instruct: Given a user's reasoning followed by a web search query, retrieve relevant passages that answer the query while incorporating the user's reasoning\nQuery:"
+
+trainer:
+  batch_size: 16
+  steps: 650
+  warmup_steps: 4
+  compile_warmup: true
+  probe_every_steps: 50
+  learning_rate: 3.0e-6
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  seed: 42
+
+loss:
+  single_vector_temperature: 0.05
+
+output:
+  name: training_b200_single_vector
