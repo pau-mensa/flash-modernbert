@@ -14,11 +14,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from flash_modernbert import ops
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.state import ATTR
+from packed_encoders import ops
+from packed_encoders.config import ModernBertParams
+from packed_encoders.state import ATTR
 
-_GRAPH_ENV = "FLASH_MODERNBERT_GRAPH"
+_GRAPH_ENV = "PACKED_ENCODERS_GRAPH"
 
 
 @dataclass(frozen=True)
@@ -320,7 +320,7 @@ def packed_forward(
     unchanged: attention takes `cu_seqlens` (confining it within each sequence) and RoPE
     takes per-token-gathered cos/sin.
 
-    When ``fm.prepare(cuda_graph=...)`` is active, the packed graph runner captures this
+    When ``fm.pack(cuda_graph=...)`` is active, the packed graph runner captures this
     function at a fixed token budget and replays on subsequent calls, eliminating all
     per-kernel dispatch overhead.  Falls back to eager when inputs exceed the graph
     budget or when grad/autocast is enabled.

@@ -30,8 +30,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from flash_modernbert import forward
-from flash_modernbert.config import ModernBertParams
+from packed_encoders import forward
+from packed_encoders.config import ModernBertParams
 
 
 @dataclass(frozen=True)
@@ -293,10 +293,10 @@ def build_train_runner(
 def set_train_cuda_graph(
     model: object, enabled: bool, *, config: TrainGraphConfig | None = None
 ) -> None:
-    """Turn the training-graph layer on or off after `prepare()`. See the module
+    """Turn the training-graph layer on or off after `pack()`. See the module
     docstring for the two caller invariants (`set_to_none=False`, exact `(B, S)`)."""
-    from flash_modernbert.locate import find_encoder
-    from flash_modernbert.state import get_state
+    from packed_encoders.locate import find_encoder
+    from packed_encoders.state import get_state
 
     state = get_state(model)
     if enabled and state.train_graph_runner is None:

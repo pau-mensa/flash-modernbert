@@ -1,8 +1,8 @@
-# flash-modernbert
+# packed-encoders
 
 A fast, monkeypatching encoder for ModernBERT / mmBERT.
 
-`prepare(model)` installs a validated **fused-tail** forward — CuteDSL LayerNorm,
+`pack(model)` installs a validated **fused-tail** forward — CuteDSL LayerNorm,
 RoPE, and GeGLU kernels, cuBLAS GEMMs, and vendor SDPA attention — onto a live
 Hugging Face `ModernBertModel` **in place**. Because the kernels already consume
 HF's exact weight layout, nothing is re-packed: `state_dict`, `save_pretrained`,
@@ -11,21 +11,21 @@ Face, SentenceTransformers, and PyLate inherit the speedup with no per-framework
 adapter.
 
 ```python
-import flash_modernbert as fm
+import packed_encoders as fm
 from transformers import AutoModel
 
 model = AutoModel.from_pretrained("answerdotai/ModernBERT-base", dtype="bfloat16").cuda()
-fm.prepare(model)                      # eager fused forward (default)
+fm.pack(model)                      # eager fused forward (default)
 out = model(input_ids=ids, attention_mask=mask).last_hidden_state
 ```
 
-It also works through the framework wrappers — `prepare()` locates the encoder
+It also works through the framework wrappers — `pack()` locates the encoder
 inside a `SentenceTransformer` or a PyLate `ColBERT` and patches it:
 
 ```python
 from sentence_transformers import SentenceTransformer
 st = SentenceTransformer("some-modernbert-model").cuda().bfloat16()
-fm.prepare(st)
+fm.pack(st)
 emb = st.encode(texts)
 ```
 
@@ -35,22 +35,22 @@ For the short-sequence regime where the eager fused tail is host-launch-bound,
 the bucketed CUDA-graph runner collapses the launch floor to a single replay:
 
 ```python
-fm.prepare(model, cuda_graph=True)
+fm.pack(model, cuda_graph=True)
 # or with an explicit bucketing policy:
-fm.prepare(model, cuda_graph=fm.GraphConfig(pad_to=64, max_graphs=32))
+fm.pack(model, cuda_graph=fm.GraphConfig(pad_to=64, max_graphs=32))
 
 with fm.no_cuda_graph(model):          # bypass graphs for a one-off odd shape
     out = model(input_ids=huge_ids, attention_mask=huge_mask)
 fm.set_cuda_graph(model, False)        # or flip after the fact
 ```
 
-The kill switch `FLASH_MODERNBERT_GRAPH=0` disables graphs globally. Out-of-bucket
+The kill switch `PACKED_ENCODERS_GRAPH=0` disables graphs globally. Out-of-bucket
 or oversized shapes fall back to the eager forward automatically — numerically
 identical, just un-graphed.
 
 ## `validate()` — a hard gate, not a silent fallback
 
-`prepare()` runs `validate()` by default (`validate=False` to skip). It **raises**
+`pack()` runs `validate()` by default (`validate=False` to skip). It **raises**
 rather than degrading silently, because enabling on a mismatched architecture or
 device would mean *wrong embeddings*, not just slower ones. It checks:
 

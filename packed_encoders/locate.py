@@ -1,4 +1,4 @@
-"""Find the ModernBERT encoder inside whatever the caller hands `prepare()`.
+"""Find the ModernBERT encoder inside whatever the caller hands `pack()`.
 
 HF `AutoModel`, SentenceTransformers, and PyLate ColBERT all ultimately hold one
 `ModernBertModel`. This walks the known wrapper shapes to it and raises on an unknown
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from torch import nn
 
-from flash_modernbert.config import SUPPORTED_MODEL_TYPES
-from flash_modernbert.errors import UnsupportedTargetError
+from packed_encoders.config import SUPPORTED_MODEL_TYPES
+from packed_encoders.errors import UnsupportedTargetError
 
 # Attribute chains a wrapper uses to reach the backbone, most-specific first.
 # `auto_model`: SentenceTransformers Transformer / PyLate. `model`: HF task heads
@@ -74,7 +74,7 @@ def _first_submodule(target: object):
 def _describe(target: object) -> str:
     return (
         f"could not locate a ModernBERT encoder in {type(target).__name__!r}. "
-        "flash-modernbert patches a Hugging Face ModernBertModel, a "
+        "packed-encoders patches a Hugging Face ModernBertModel, a "
         "SentenceTransformer / PyLate ColBERT wrapping one, or a task model "
         "exposing it via .auto_model / .model. Pass the encoder directly if it "
         "lives somewhere else."

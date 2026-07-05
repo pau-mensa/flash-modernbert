@@ -1,9 +1,9 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
-# dependencies = ["flash-modernbert", "transformers", "pytest"]
+# dependencies = ["packed-encoders", "transformers", "pytest"]
 #
 # [tool.uv.sources]
-# flash-modernbert = { path = "../", editable = true }
+# packed-encoders = { path = "../", editable = true }
 # torch = { index = "pytorch-cu128" }
 #
 # [[tool.uv.index]]
@@ -14,7 +14,7 @@
 """B1 — the training-graph runner: capture the encoder fwd+bwd and replay it
 inside autograd, reproducing the eager fused tail's gradients.
 
-Drives the `_TrainGraphRunner` directly (no `prepare()`). The reference is the
+Drives the `_TrainGraphRunner` directly (no `pack()`). The reference is the
 *same* dense-mask, capture-safe forward the runner captures — the only forward a
 fixed graph can replay — so any gap is the capture/replay itself, not the
 dense-vs-flash mask choice. Checks the three properties GradCache relies on:
@@ -46,7 +46,7 @@ def encoder():
 
 @pytest.fixture(scope="module")
 def params(encoder):
-    from flash_modernbert.config import ModernBertParams
+    from packed_encoders.config import ModernBertParams
 
     return ModernBertParams.from_hf_config(encoder.config)
 
@@ -65,7 +65,7 @@ def runner(encoder, params):
     captures on the shared default capture stream, so cross-bucket AccumulateGrad
     streams stay consistent (a fresh runner per test would leave a stale-stream
     graph alive that breaks the next capture)."""
-    from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
+    from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
 
     # max_seq high so every parametrized shape (incl. S=288) actually captures —
     # this fixture tests capture/replay *fidelity*; the runtime queries-only gate
@@ -104,7 +104,7 @@ def _eager_dense_grads(encoder, params, weights, ids, mask, grad_seed):
     (not `.backward()`) so it leaves no AccumulateGrad node on the encoder params
     — which would otherwise linger on the default stream and break the next
     capture (the real GradCache path never accumulates eagerly into them)."""
-    from flash_modernbert import forward
+    from packed_encoders import forward
 
     p = forward.prologue(encoder, params, ids, mask, dense_mask=True, capture_safe=True)
     out = forward.core(
@@ -180,9 +180,9 @@ def test_autocast_capture_matches_eager_and_tracks_weight_updates():
     so each replay recasts from the persistent fp32 master, tracking the
     optimizer's in-place updates rather than replaying a stale captured copy."""
     from transformers import AutoModel
-    from flash_modernbert.config import ModernBertParams
-    from flash_modernbert import forward
-    from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
+    from packed_encoders.config import ModernBertParams
+    from packed_encoders import forward
+    from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
 
     enc = AutoModel.from_pretrained(MODEL_ID, dtype=torch.float32).cuda().train()
     params = ModernBertParams.from_hf_config(enc.config)
@@ -223,7 +223,7 @@ def test_autocast_capture_matches_eager_and_tracks_weight_updates():
 def test_oversized_shape_falls_back_to_eager(encoder, params, weights):
     """A shape beyond max_tokens is never captured — it runs the eager fused
     forward (still autograd-correct, just un-graphed)."""
-    from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
+    from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
 
     ids, mask, grad_seed = _batch(8, 64, encoder.config.vocab_size, seed=3)
     runner = build_train_runner(encoder, params, TrainGraphConfig(max_tokens=1, warmup=3))
@@ -240,7 +240,7 @@ def test_long_seq_falls_back_to_eager(encoder, params, weights):
     """The queries-only gate: with max_seq=64, a short (query) shape is captured but
     a long (doc) shape falls straight through to eager — the per-call queries-vs-docs
     split. Both still produce correct grads."""
-    from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
+    from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
 
     runner = build_train_runner(encoder, params, TrainGraphConfig(max_seq=64, warmup=3))
     vocab = encoder.config.vocab_size
@@ -260,18 +260,18 @@ def test_long_seq_falls_back_to_eager(encoder, params, weights):
     assert all(p.grad is not None for p in weights)
 
 
-def test_end_to_end_prepare_train_graph_engages_and_matches_eager():
-    """B4 wiring — `prepare(train_cuda_graph=True)` routes the grad-enabled forward
+def test_end_to_end_pack_train_graph_engages_and_matches_eager():
+    """B4 wiring — `pack(train_cuda_graph=True)` routes the grad-enabled forward
     through the train runner (it engages, the bucket cache populates), and a real
     training step through the patched forward reproduces the eager fused (dense)
     backward bit-exactly. (The graph captures the dense-mask forward; comparing to
     the *default* flash-path forward would instead surface the bf16 dense-vs-flash
     backward band, which is characterized in the benchmarks, not gated here.)"""
-    import flash_modernbert as fm
-    from flash_modernbert import forward
-    from flash_modernbert.config import ModernBertParams
+    import packed_encoders as fm
+    from packed_encoders import forward
+    from packed_encoders.config import ModernBertParams
     from transformers import AutoModel
-    from flash_modernbert.state import get_state
+    from packed_encoders.state import get_state
 
     model = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().train()
     params = ModernBertParams.from_hf_config(model.config)
@@ -280,7 +280,7 @@ def test_end_to_end_prepare_train_graph_engages_and_matches_eager():
         p.grad = torch.zeros_like(p)
     ids, mask, grad_seed = _batch(16, 32, model.config.vocab_size, seed=21)
 
-    fm.prepare(model, train_cuda_graph=True, validate=False)
+    fm.pack(model, train_cuda_graph=True, validate=False)
 
     # A real fwd+bwd through the patched forward (grad on → routes to train runner).
     for p in w:

@@ -4,10 +4,10 @@ models:
 
 variants:
   - pylate_compile_dynamic
-  - pylate_prepare
+  - pylate_pack
   - pylate_packed
   - st_compile_dynamic
-  - st_prepare
+  - st_pack
   - st_packed
 
 index:

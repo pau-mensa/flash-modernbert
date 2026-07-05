@@ -1,4 +1,4 @@
-"""Two-family training showcase: stock, prepared, and fully packed.
+"""Two-family training showcase: stock, patched, and fully packed.
 
 The small configs lock the visual/result contract with real AgentIR groups and
 real optimizer steps. The faithful B200 configs use the official effective
@@ -27,20 +27,20 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-import flash_modernbert as fm
+import packed_encoders as fm
 from _common import RESULTS_DIR, device_banner, ema, load_config, new_figure
-from flash_modernbert import forward
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.locate import find_encoder
+from packed_encoders import forward
+from packed_encoders.config import ModernBertParams
+from packed_encoders.locate import find_encoder
 from packed_collator import pack_sequences
 from packed_index import tokenize_colbert_no_padding
 
 
 FAMILIES = ("late_interaction", "single_vector")
-VARIANTS = ("stock", "prepare", "packed")
-COMPILED_VARIANTS = frozenset(("prepare", "packed"))
-LABELS = {"stock": "Stock", "prepare": "fm.prepare", "packed": "Packed"}
-COLORS = {"stock": "#3b6ea5", "prepare": "#6a4c93", "packed": "#d1495b"}
+VARIANTS = ("stock", "pack", "packed")
+COMPILED_VARIANTS = frozenset(("pack", "packed"))
+LABELS = {"stock": "Stock", "pack": "fm.pack", "packed": "Packed"}
+COLORS = {"stock": "#3b6ea5", "pack": "#6a4c93", "packed": "#d1495b"}
 
 
 def _compile_warmup_enabled(trainer: dict, variant: str) -> bool:
@@ -98,8 +98,8 @@ def _load_model(cfg: dict, family: str, variant: str):
         name = section["single_vector"]
         tokenizer = AutoTokenizer.from_pretrained(name)
         model = AutoModel.from_pretrained(name, dtype=torch.bfloat16).cuda()
-    if variant == "prepare":
-        fm.prepare(model, attention_backend="flash", validate=False)
+    if variant == "pack":
+        fm.pack(model, attention_backend="flash", validate=False)
     return model.train(), tokenizer
 
 
@@ -253,7 +253,7 @@ def _probe_loss(cfg, family, model, tokenizer, batch):
     try:
         with torch.inference_mode():
             # packed_forward directly reads the encoder weights, bypassing both
-            # the stock padded forward and fm.prepare's patched forward.  This
+            # the stock padded forward and fm.pack's patched forward.  This
             # makes step-zero and subsequent probe losses directly comparable.
             return _loss(cfg, family, "packed", model, tokenizer, batch).detach()
     finally:
@@ -606,7 +606,7 @@ def _timing_comparison(results: dict) -> dict:
             measured = summary.get("measured_training_seconds")
             if measured is None:
                 measured = sum(row["step_ms"] for row in result["per_step"]) / 1e3
-            # Stock is eager. Only real training-path warmup for prepared and
+            # Stock is eager. Only real training-path warmup for patched and
             # packed variants enters this comparison; fixed-probe setup does not.
             compile_seconds = (
                 float(summary.get("compile_warmup_seconds", 0.0))

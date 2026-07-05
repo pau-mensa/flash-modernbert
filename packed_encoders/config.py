@@ -1,6 +1,6 @@
 """The slice of ModernBERT config the fused forward consumes.
 
-Built from a HF config once at `prepare()` time, decoupling the forward from HF's
+Built from a HF config once at `pack()` time, decoupling the forward from HF's
 schema churn — notably the transformers 5.x move of the RoPE thetas under
 `rope_parameters[{full,sliding}_attention]`, which `from_hf_config` absorbs.
 """
@@ -50,7 +50,7 @@ class ModernBertParams:
         model_type = getattr(config, "model_type", None)
         if model_type not in SUPPORTED_MODEL_TYPES:
             raise ValueError(
-                "flash-modernbert only supports ModernBERT-architecture "
+                "packed-encoders only supports ModernBERT-architecture "
                 f"checkpoints {sorted(SUPPORTED_MODEL_TYPES)}; got "
                 f"model_type={model_type!r}"
             )

@@ -1,7 +1,7 @@
 """Packed token-budget collator — **showcase scaffolding** (P0 of the packed paradigm).
 
-NOT part of the shipped flash-modernbert surface (see `docs/packed_paradigm_showcase.md`
-§8). It produces the already-packed input that `flash_modernbert.forward.packed_forward`
+NOT part of the shipped packed-encoders surface (see `docs/packed_paradigm_showcase.md`
+§8). It produces the already-packed input that `packed_encoders.forward.packed_forward`
 consumes — real tokens only, no padding, end-to-end. The shipped package keeps the `[B, S]`
 drop-in forward; this collator is how the *showcase* opts into the fully-packed paradigm.
 
@@ -179,7 +179,7 @@ def assert_positions_match_unpad(packed: PackedBatch, attention_mask: Tensor) ->
 
     `attention_mask` is the padded baseline's `[B, S]` mask for the same sequences in the
     same order (right-padded)."""
-    from flash_modernbert import forward as _fwd  # local: showcase-only dep on internals
+    from packed_encoders import forward as _fwd  # local: showcase-only dep on internals
 
     am = attention_mask.cpu()
     b, s = am.shape

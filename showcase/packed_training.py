@@ -21,9 +21,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flash_modernbert import forward
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.locate import find_encoder
+from packed_encoders import forward
+from packed_encoders.config import ModernBertParams
+from packed_encoders.locate import find_encoder
 
 from packed_collator import pack_sequences
 from packed_index import tokenize_colbert_no_padding

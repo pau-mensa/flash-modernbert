@@ -12,16 +12,16 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from flash_modernbert._kernels.geglu import (
+from packed_encoders._kernels.geglu import (
     geglu as _geglu_kernel,
     geglu_bwd as _geglu_bwd_kernel,
 )
-from flash_modernbert._kernels.layer_norm import (
+from packed_encoders._kernels.layer_norm import (
     layer_norm as _ln_kernel,
     layer_norm_with_stats as _ln_kernel_with_stats,
 )
-from flash_modernbert._kernels.ln_bwd_inplace import ln_bwd as _ln_bwd_dyn_kernel
-from flash_modernbert._kernels.rope import (
+from packed_encoders._kernels.ln_bwd_inplace import ln_bwd as _ln_bwd_dyn_kernel
+from packed_encoders._kernels.rope import (
     apply_rope as _rope_kernel,
     apply_rope_bshd as _rope_bshd_kernel,
     _bshd_applicable,
@@ -107,7 +107,7 @@ def fused_layer_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch
         torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
     ):
         return _LayerNormFn.apply(x, weight, eps)
-    from flash_modernbert._kernels.triton_layer_norm import layer_norm as _triton_ln
+    from packed_encoders._kernels.triton_layer_norm import layer_norm as _triton_ln
 
     return _triton_ln(x.detach(), weight.detach(), eps)
 
@@ -179,7 +179,7 @@ class _GegluFn(torch.autograd.Function):
 def fused_geglu(proj, *, out_dtype=None):
     if torch.is_grad_enabled() and proj.requires_grad:
         return _GegluFn.apply(proj, out_dtype)
-    from flash_modernbert._kernels.triton_layer_norm import geglu as _triton_geglu
+    from packed_encoders._kernels.triton_layer_norm import geglu as _triton_geglu
 
     return _triton_geglu(proj.detach())
 
@@ -198,7 +198,7 @@ def _linear(x, weight):
         and n <= _TRITON_MM_MAX_ROWS
         and x.dtype == weight.dtype
     ):
-        from flash_modernbert._kernels.matmul import triton_linear
+        from packed_encoders._kernels.matmul import triton_linear
 
         return triton_linear(x, weight)
     return F.linear(x, weight, None)
@@ -211,7 +211,7 @@ def fused_add_layer_norm(
     if torch.is_grad_enabled() and (x.requires_grad or residual.requires_grad):
         x_new = x + residual
         return x_new, fused_layer_norm(x_new, weight, eps)
-    from flash_modernbert._kernels.triton_layer_norm import add_layer_norm
+    from packed_encoders._kernels.triton_layer_norm import add_layer_norm
 
     return add_layer_norm(x.detach(), residual.detach(), weight.detach(), eps)
 
@@ -454,7 +454,7 @@ def attention(q, k, v, *, mask, window, scaling, backend, cu_seqlens=None, max_s
     flash). `cu_seqlens` routes flash to the varlen path. `"auto"` resolves per call
     from `q`'s sequence length (flash at `S >= FLASH_MIN_SEQ`, else sdpa) — resolving
     at the leaf lets a captured graph bake in the right path per `(B, S)` bucket.
-    `prepare()` downgrades `"auto"` to `"sdpa"` up front if no kernel is loadable, so
+    `pack()` downgrades `"auto"` to `"sdpa"` up front if no kernel is loadable, so
     this never imports mid-capture."""
     if backend == "auto":
         backend = "flash" if q.shape[2] >= FLASH_MIN_SEQ else "sdpa"

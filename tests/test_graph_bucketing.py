@@ -1,9 +1,9 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
-# dependencies = ["flash-modernbert", "transformers", "pytest"]
+# dependencies = ["packed-encoders", "transformers", "pytest"]
 #
 # [tool.uv.sources]
-# flash-modernbert = { path = "../", editable = true }
+# packed-encoders = { path = "../", editable = true }
 # torch = { index = "pytorch-cu128" }
 #
 # [[tool.uv.index]]
@@ -14,7 +14,7 @@
 """A3 — the graph runner's bucketing policy: batch-dim bucketing, a bounded LRU
 cache under a stream of variable shapes, and seq_bucket pre-capture.
 
-Drives the `_GraphRunner` directly (no `prepare()`) so each policy is exercised
+Drives the `_GraphRunner` directly (no `pack()`) so each policy is exercised
 in isolation and checked against the eager fused forward for correctness.
 
     uv run pytest tests/test_graph_bucketing.py -q     # on a validated GPU (sm_120 here)
@@ -42,7 +42,7 @@ def encoder():
 
 @pytest.fixture(scope="module")
 def params(encoder):
-    from flash_modernbert.config import ModernBertParams
+    from packed_encoders.config import ModernBertParams
 
     return ModernBertParams.from_hf_config(encoder.config)
 
@@ -63,7 +63,7 @@ def _cos(a, b):
 
 def _fused(encoder, params, ids, mask):
     """The eager fused forward — what an out-of-bucket batch falls back to."""
-    from flash_modernbert import forward
+    from packed_encoders import forward
 
     with torch.no_grad():
         return forward.fused_forward(encoder, params, ids, mask)
@@ -75,7 +75,7 @@ def _replay_ref(encoder, params, ids, mask, bb, sb):
     graph replay must reproduce this near bit-for-bit (capture/replay fidelity);
     comparing against the eager fused_forward instead would fold in the flash-vs-
     dense SDPA backend band, which is a fused-tail property, not a graph one."""
-    from flash_modernbert import forward
+    from packed_encoders import forward
 
     b, s = ids.shape
     pad_ids = torch.zeros((bb, sb), dtype=ids.dtype, device="cuda")
@@ -100,7 +100,7 @@ def _replay_ref(encoder, params, ids, mask, bb, sb):
 
 
 def test_batch_bucketing_one_graph_for_all_b_le_max(encoder, params):
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     vocab = int(encoder.config.vocab_size)
     runner = build_runner(encoder, params, GraphConfig(pad_to=64, max_batch=8))
@@ -118,7 +118,7 @@ def test_batch_bucketing_one_graph_for_all_b_le_max(encoder, params):
 
 
 def test_batch_over_max_falls_back_to_eager(encoder, params):
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     vocab = int(encoder.config.vocab_size)
     runner = build_runner(encoder, params, GraphConfig(pad_to=64, max_batch=4))
@@ -135,7 +135,7 @@ def test_seq_cutoff_routes_long_to_eager(encoder, params):
     """max_seq is the short-S gate: a call with s <= max_seq is captured, a longer
     one runs eager and is never captured (the inference queries-vs-docs split).
     Both stay numerically correct."""
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     vocab = int(encoder.config.vocab_size)
     runner = build_runner(encoder, params, GraphConfig(pad_to=32, max_seq=64))
@@ -158,7 +158,7 @@ def test_seq_cutoff_routes_long_to_eager(encoder, params):
 
 
 def test_per_b_graphs_when_max_batch_none(encoder, params):
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     vocab = int(encoder.config.vocab_size)
     runner = build_runner(encoder, params, GraphConfig(pad_to=64, max_graphs=8))
@@ -177,7 +177,7 @@ def test_per_b_graphs_when_max_batch_none(encoder, params):
 
 
 def test_lru_cache_stays_bounded(encoder, params):
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     vocab = int(encoder.config.vocab_size)
     runner = build_runner(encoder, params, GraphConfig(pad_to=64, max_batch=2, max_graphs=3))
@@ -195,7 +195,7 @@ def test_lru_cache_stays_bounded(encoder, params):
 
 
 def test_lru_promotes_on_replay(encoder, params):
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     vocab = int(encoder.config.vocab_size)
     runner = build_runner(encoder, params, GraphConfig(pad_to=64, max_batch=2, max_graphs=2))
@@ -212,12 +212,12 @@ def test_lru_promotes_on_replay(encoder, params):
 
 
 # ---------------------------------------------------------------------------
-# seq_bucket pre-capture at build time (the prepare()-time path).
+# seq_bucket pre-capture at build time (the pack()-time path).
 # ---------------------------------------------------------------------------
 
 
 def test_seq_buckets_precaptured_at_build(encoder, params):
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     runner = build_runner(
         encoder, params,
@@ -227,7 +227,7 @@ def test_seq_buckets_precaptured_at_build(encoder, params):
 
 
 def test_seq_buckets_without_max_batch_warns(encoder, params):
-    from flash_modernbert.graph import GraphConfig, build_runner
+    from packed_encoders.graph import GraphConfig, build_runner
 
     with pytest.warns(UserWarning, match="seq_buckets needs max_batch"):
         runner = build_runner(encoder, params, GraphConfig(seq_buckets=(64,)))

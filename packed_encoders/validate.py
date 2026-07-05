@@ -15,11 +15,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from flash_modernbert import forward
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.errors import ValidationError
-from flash_modernbert.locate import find_encoder
-from flash_modernbert.state import ATTR
+from packed_encoders import forward
+from packed_encoders.config import ModernBertParams
+from packed_encoders.errors import ValidationError
+from packed_encoders.locate import find_encoder
+from packed_encoders.state import ATTR
 
 # Compute capabilities the fused-tail FORWARD is numerically validated on (sm_90/100/120
 # bit-identical; sm_80/sm_89 within the 0.997 band, scripts/modal_arch_probe.py). This
@@ -77,7 +77,7 @@ def _encoder_device(encoder: nn.Module) -> torch.device:
     if device.type != "cuda":
         raise ValidationError(
             f"the fused path requires CUDA weights; the model is on {device!r}. "
-            "Move it to a GPU before calling prepare()."
+            "Move it to a GPU before calling pack()."
         )
     return device
 
@@ -91,7 +91,7 @@ def _check_cutlass_toolchain(device: torch.device) -> str:
             f"nvidia-cutlass-dsl {version} is below the validated floor "
             f"{'.'.join(map(str, MIN_CUTLASS_DSL))}"
         )
-    from flash_modernbert._kernels.layer_norm import layer_norm as _ln_kernel
+    from packed_encoders._kernels.layer_norm import layer_norm as _ln_kernel
 
     try:
         x = torch.randn(32, 256, dtype=torch.bfloat16, device=device)

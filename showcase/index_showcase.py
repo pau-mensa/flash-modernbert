@@ -1,9 +1,9 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
-# dependencies = ["flash-modernbert", "pylate", "sentence-transformers", "datasets", "matplotlib", "pyyaml", "flash-attn"]
+# dependencies = ["packed-encoders", "pylate", "sentence-transformers", "datasets", "matplotlib", "pyyaml", "flash-attn"]
 #
 # [tool.uv.sources]
-# flash-modernbert = { path = "../", editable = true }
+# packed-encoders = { path = "../", editable = true }
 # pylate = { git = "https://github.com/pau-mensa/pylate.git" }
 # torch = { index = "pytorch-cu128" }
 # flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" }
@@ -16,7 +16,7 @@
 """Long-document indexing comparison on Tevatron/AgentIR-data.
 
 The ST lane is a pooled-vector deployment control.  The three PyLate bars are
-the causal comparison: strongest compiled padded encoder, drop-in prepare with
+the causal comparison: strongest compiled padded encoder, drop-in pack with
 a padded index, and a fully packed encoder/index.  MaxSim is intentionally out
 of scope: indexing only creates document representations.
 """
@@ -38,9 +38,9 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-import flash_modernbert as fm
+import packed_encoders as fm
 from _common import RESULTS_DIR, device_banner, load_agentir_passages, load_config
-from flash_modernbert.locate import find_encoder
+from packed_encoders.locate import find_encoder
 from packed_index import (
     PackedIndex,
     PaddedIndex,
@@ -55,17 +55,17 @@ from packed_index import (
 # Grouped by the two figures the showcase produces.  Late interaction (PyLate)
 # emits one embedding per retained document token; single vector (ST) emits one
 # pooled embedding per document.  Within each family the three bars are the same
-# comparison: strongest compiled stock encoder, drop-in `fm.prepare` padded, and
+# comparison: strongest compiled stock encoder, drop-in `fm.pack` padded, and
 # a fully packed encoder/index.
-LATE_INTERACTION = ("pylate_compile_dynamic", "pylate_prepare", "pylate_packed")
-SINGLE_VECTOR = ("st_compile_dynamic", "st_prepare", "st_packed")
+LATE_INTERACTION = ("pylate_compile_dynamic", "pylate_pack", "pylate_packed")
+SINGLE_VECTOR = ("st_compile_dynamic", "st_pack", "st_packed")
 MAIN_VARIANTS = (*LATE_INTERACTION, *SINGLE_VECTOR)
 VARIANTS = (*MAIN_VARIANTS, "st_compile", "pylate_compile")
 
 # For each model family, the reference variant that parity candidates must match.
 PARITY_FAMILIES = {
-    "pylate_compile_dynamic": ("pylate_prepare", "pylate_packed"),
-    "st_compile_dynamic": ("st_prepare", "st_packed"),
+    "pylate_compile_dynamic": ("pylate_pack", "pylate_packed"),
+    "st_compile_dynamic": ("st_pack", "st_packed"),
 }
 
 
@@ -160,8 +160,8 @@ def _encode_st_packed(model, tokenized: TokenizedTexts, batch_size: int):
     The pooled index is identical in size to ordinary ST — both store one `[H]` vector
     per document — so the only wins are encoder throughput and temporary VRAM.
     """
-    from flash_modernbert import forward
-    from flash_modernbert.config import ModernBertParams
+    from packed_encoders import forward
+    from packed_encoders.config import ModernBertParams
     from packed_collator import pack_sequences
 
     encoder = find_encoder(model)
@@ -357,7 +357,7 @@ def _build_variant(variant: str, cfg: dict, docs: list[str]):
     buckets = [int(x) for x in bench.get("length_buckets", [256, 512, 1024, 2048])]
     load_start = time.perf_counter()
 
-    if variant in ("st_compile", "st_compile_dynamic", "st_prepare", "st_packed"):
+    if variant in ("st_compile", "st_compile_dynamic", "st_pack", "st_packed"):
         from sentence_transformers import SentenceTransformer
 
         model_name = models_cfg.get("sentence_transformers", "answerdotai/ModernBERT-base")
@@ -369,8 +369,8 @@ def _build_variant(variant: str, cfg: dict, docs: list[str]):
                 mode="max-autotune",
                 dynamic=variant == "st_compile_dynamic",
             )
-        elif variant in ("st_prepare", "st_packed"):
-            fm.prepare(model, attention_backend="flash", validate=False)
+        elif variant in ("st_pack", "st_packed"):
+            fm.pack(model, attention_backend="flash", validate=False)
         model_load_s = time.perf_counter() - load_start
         token_start = time.perf_counter()
         tokens = _tokenized_st(model, docs, document_length)
@@ -401,8 +401,8 @@ def _build_variant(variant: str, cfg: dict, docs: list[str]):
                 mode="max-autotune",
                 dynamic=variant == "pylate_compile_dynamic",
             )
-        elif variant == "pylate_prepare":
-            fm.prepare(model, attention_backend="flash", validate=False)
+        elif variant == "pylate_pack":
+            fm.pack(model, attention_backend="flash", validate=False)
         model_load_s = time.perf_counter() - load_start
         token_start = time.perf_counter()
         tokens = tokenize_colbert_no_padding(model, docs, is_query=False)
@@ -484,7 +484,7 @@ def _worker(variant: str, cfg: dict, docs: list[str], result_path: Path) -> None
 
 
 def _parity(results: dict[str, dict]) -> dict:
-    """Gate each family's prepared/packed variants against its compiled reference.
+    """Gate each family's patched/packed variants against its compiled reference.
 
     Both the late-interaction (per-token) and single-vector (pooled) families are
     checked when present, each against its own stock compiled encoder.
@@ -535,7 +535,7 @@ def run(cfg: dict) -> dict:
             env = os.environ.copy()
             env["TORCHINDUCTOR_CACHE_DIR"] = str(cache_path)
             env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
-            env["FLASH_MODERNBERT_DSL_CACHE"] = "0"
+            env["PACKED_ENCODERS_DSL_CACHE"] = "0"
             command = [
                 sys.executable,
                 str(Path(__file__).resolve()),

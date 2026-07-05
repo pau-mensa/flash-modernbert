@@ -10,7 +10,7 @@ launch on the captured stream during `torch.cuda.graph(...)`. Without it they de
 the legacy default stream, which graph capture does NOT record — producing silently-wrong
 replay output.
 
-Persistent disk cache (`FLASH_MODERNBERT_DSL_CACHE=1`, default off): the `compile_only`
+Persistent disk cache (`PACKED_ENCODERS_DSL_CACHE=1`, default off): the `compile_only`
 path forces CuteDSL's `no_cache=True`, disabling its built-in cross-process disk cache,
 so every fresh process recompiles from scratch (tens of seconds of ptxas each). When the
 env var is set, the first call of each kernel routes through the normal path (engaging the
@@ -34,7 +34,7 @@ _caches: dict[int, dict[Any, Any]] = {}
 # Opt-in persistent disk cache. When set, the first call of each kernel goes
 # through CuteDSL's normal path so its built-in $CUTE_DSL_CACHE_DIR file cache
 # persists the compiled cubin across processes (skips ptxas on reload).
-_DSL_CACHE = os.environ.get("FLASH_MODERNBERT_DSL_CACHE", "0") == "1"
+_DSL_CACHE = os.environ.get("PACKED_ENCODERS_DSL_CACHE", "0") == "1"
 
 
 def get_compiled(launcher, args: tuple, key) -> Any:
@@ -44,7 +44,7 @@ def get_compiled(launcher, args: tuple, key) -> Any:
     cached callable. The caller calls the result with the same args shape they passed here.
 
     Default path returns a `JitCompiledFunction` (fast ~7 µs dispatch, no disk cache).
-    With `FLASH_MODERNBERT_DSL_CACHE=1`, returns a `_FileCacheDispatch` wrapper that engages
+    With `PACKED_ENCODERS_DSL_CACHE=1`, returns a `_FileCacheDispatch` wrapper that engages
     CuteDSL's persistent disk cache on first use (see module docstring).
     """
     inner = _caches.setdefault(id(launcher), {})
@@ -113,7 +113,7 @@ def _normal_call_capturing(launcher, args):
             _ch.JitCacheDict.set = orig_set
             _ch.JitCacheDict.get = orig_get
 
-    if os.environ.get("FLASH_MODERNBERT_DSL_CACHE_DEBUG") == "1":
+    if os.environ.get("PACKED_ENCODERS_DSL_CACHE_DEBUG") == "1":
         info = [
             (type(f).__name__, getattr(f, "engine", "NOATTR") is not None)
             for f in captured
@@ -133,7 +133,7 @@ def _normal_call_capturing(launcher, args):
 
 
 class _FileCacheDispatch:
-    """Callable wrapper used only under `FLASH_MODERNBERT_DSL_CACHE=1`.
+    """Callable wrapper used only under `PACKED_ENCODERS_DSL_CACHE=1`.
 
     First call routes through CuteDSL's normal path (engages the persistent disk
     file cache + executes once + captures the compiled fn); subsequent calls use

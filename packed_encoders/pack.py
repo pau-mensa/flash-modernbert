@@ -1,7 +1,7 @@
-"""`prepare()` — install the fused forward onto a live model, in place.
+"""`pack()` — install the fused forward onto a live model, in place.
 
 Patch, don't re-implement: the kernels already consume HF's exact weight layout, so
-`prepare()` swaps the encoder's bound `forward` and leaves everything else
+`pack()` swaps the encoder's bound `forward` and leaves everything else
 (`state_dict`, `save_pretrained`, ...) as HF's own. One patch, and HF /
 SentenceTransformers / PyLate all inherit the speedup with no adapter class.
 """
@@ -14,18 +14,18 @@ import torch
 from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutput
 
-from flash_modernbert import ops
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.errors import FlashModernBertError
-from flash_modernbert.forward import fused_forward
-from flash_modernbert.graph import GraphConfig, build_packed_runner, build_runner, graphs_globally_disabled
-from flash_modernbert.train_graph import TrainGraphConfig, build_train_runner
-from flash_modernbert.locate import find_encoder
-from flash_modernbert.state import ATTR, PatchState
-from flash_modernbert.validate import validate as _validate
+from packed_encoders import ops
+from packed_encoders.config import ModernBertParams
+from packed_encoders.errors import PackedEncodersError
+from packed_encoders.forward import fused_forward
+from packed_encoders.graph import GraphConfig, build_packed_runner, build_runner, graphs_globally_disabled
+from packed_encoders.train_graph import TrainGraphConfig, build_train_runner
+from packed_encoders.locate import find_encoder
+from packed_encoders.state import ATTR, PatchState
+from packed_encoders.validate import validate as _validate
 
 
-def prepare(
+def pack(
     target: object,
     *,
     cuda_graph: bool | GraphConfig = False,
@@ -63,12 +63,12 @@ def prepare(
     - `"auto"` — sdpa below `ops.FLASH_MIN_SEQ`, flash above, per call. Falls back to
       `"sdpa"` (with a warning) if no kernel is present.
 
-    `validate` runs the hard gate during prepare.
+    `validate` runs the hard gate during pack.
     """
     if attention_backend is None:
         attention_backend = _default_backend()
     if attention_backend not in ("sdpa", "flash", "auto"):
-        raise FlashModernBertError(
+        raise PackedEncodersError(
             "attention_backend must be 'sdpa', 'flash', 'auto', or None, got "
             f"{attention_backend!r}"
         )
@@ -124,7 +124,7 @@ def _resolve_attention_backend(backend: str) -> str:
         ops._load_flash_attn()
     except ImportError as exc:
         if backend == "flash":
-            raise FlashModernBertError(str(exc)) from exc
+            raise PackedEncodersError(str(exc)) from exc
         warnings.warn(
             f"attention_backend='auto' but no FlashAttention kernel is available "
             f"({exc}); falling back to 'sdpa'.",
@@ -171,8 +171,8 @@ def _enable_train_graphs(
     state.train_graph_enabled = True
 
 
-def unprepare(target: object) -> object:
-    """Restore the original forward, reverting `prepare()`."""
+def unpack(target: object) -> object:
+    """Restore the original forward, reverting `pack()`."""
     encoder = find_encoder(target)
     state = getattr(encoder, ATTR, None)
     if state is None:
@@ -192,7 +192,7 @@ def _make_forward(encoder: nn.Module, state: PatchState):
     ):
         if input_ids is None:
             raise NotImplementedError(
-                "flash-modernbert requires input_ids (inputs_embeds is unsupported)"
+                "packed-encoders requires input_ids (inputs_embeds is unsupported)"
             )
         _reject_unsupported(kwargs)
 
@@ -224,7 +224,7 @@ def _make_forward(encoder: nn.Module, state: PatchState):
         ):
             state.graph_skip_warned = True
             warnings.warn(
-                "flash-modernbert: inference CUDA graphs are enabled but skipped here "
+                "packed-encoders: inference CUDA graphs are enabled but skipped here "
                 "because autocast or autograd is active (e.g. inside a training step). "
                 "Inference graphs apply to plain bf16 inference; for training-step "
                 "graphs pass train_cuda_graph=True. Running the eager fused forward.",
@@ -249,22 +249,22 @@ def _make_forward(encoder: nn.Module, state: PatchState):
 
 def _reject_unsupported(kwargs: dict) -> None:
     if kwargs.get("inputs_embeds") is not None:
-        raise NotImplementedError("flash-modernbert does not support inputs_embeds")
+        raise NotImplementedError("packed-encoders does not support inputs_embeds")
     if kwargs.get("output_attentions"):
-        raise NotImplementedError("flash-modernbert does not support output_attentions")
+        raise NotImplementedError("packed-encoders does not support output_attentions")
     if kwargs.get("output_hidden_states"):
-        raise NotImplementedError("flash-modernbert does not support output_hidden_states")
+        raise NotImplementedError("packed-encoders does not support output_hidden_states")
     token_type_ids = kwargs.get("token_type_ids")
     if token_type_ids is not None and bool(token_type_ids.any()):
-        raise NotImplementedError("flash-modernbert does not support non-zero token_type_ids")
+        raise NotImplementedError("packed-encoders does not support non-zero token_type_ids")
 
 
 def _require_cuda(encoder: nn.Module) -> None:
     try:
         device = next(encoder.parameters()).device
     except StopIteration as exc:
-        raise FlashModernBertError("the model has no parameters") from exc
+        raise PackedEncodersError("the model has no parameters") from exc
     if device.type != "cuda":
-        raise FlashModernBertError(
+        raise PackedEncodersError(
             f"the fused path requires CUDA weights; the model is on {device!r}"
         )

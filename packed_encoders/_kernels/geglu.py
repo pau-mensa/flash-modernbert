@@ -24,7 +24,7 @@ import torch
 from cutlass import Float32
 from cutlass.cute.runtime import from_dlpack
 
-from flash_modernbert._kernels._compile_cache import current_cute_stream, get_compiled
+from packed_encoders._kernels._compile_cache import current_cute_stream, get_compiled
 
 THREADS_PER_BLOCK = 128
 _INV_SQRT2 = float(1.0 / math.sqrt(2.0))

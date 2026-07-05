@@ -1,9 +1,9 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
-# dependencies = ["flash-modernbert", "pylate", "sentence-transformers", "datasets", "pyyaml", "flash-attn"]
+# dependencies = ["packed-encoders", "pylate", "sentence-transformers", "datasets", "pyyaml", "flash-attn"]
 #
 # [tool.uv.sources]
-# flash-modernbert = { path = "../", editable = true }
+# packed-encoders = { path = "../", editable = true }
 # pylate = { git = "https://github.com/pau-mensa/pylate.git" }
 # torch = { index = "pytorch-cu128" }
 # flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" }
@@ -13,11 +13,11 @@
 # url = "https://download.pytorch.org/whl/cu128"
 # explicit = true
 # ///
-"""Serving-throughput comparison: compiled stock vs fm.prepare vs packed.
+"""Serving-throughput comparison: compiled stock vs fm.pack vs packed.
 
 Two endpoints, measured independently in process-isolated workers:
 
-* **Query endpoint** -- short sequences (S~32-128).  The ``prepare`` variant
+* **Query endpoint** -- short sequences (S~32-128).  The ``pack`` variant
   enables CUDA graphs: dispatch-bound at short S, replay eliminates launch
   overhead.
 * **Document endpoint** -- long sequences (S~512-2048).  No graphs: compute-
@@ -27,7 +27,7 @@ Three variants per model family (late interaction / single vector):
 
 * Compiled stock (``max-autotune``, ``dynamic=True``): strongest deployer
   baseline.
-* ``fm.prepare`` (flash attention; +CUDA graph on query endpoint): drop-in.
+* ``fm.pack`` (flash attention; +CUDA graph on query endpoint): drop-in.
 * Packed (``packed_forward`` / segment mean-pool): paradigm.
 
 Each variant runs in a fresh subprocess with a clean ``TORCHINDUCTOR_CACHE_DIR``.
@@ -51,7 +51,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-import flash_modernbert as fm
+import packed_encoders as fm
 from _common import (
     RESULTS_DIR,
     device_banner,
@@ -59,7 +59,7 @@ from _common import (
     load_agentir_queries,
     load_config,
 )
-from flash_modernbert.locate import find_encoder
+from packed_encoders.locate import find_encoder
 from packed_index import (
     PackedIndex,
     PaddedIndex,
@@ -71,13 +71,13 @@ from packed_index import (
 )
 
 
-LATE_INTERACTION = ("pylate_compile_dynamic", "pylate_prepare", "pylate_packed")
-SINGLE_VECTOR = ("st_compile_dynamic", "st_prepare", "st_packed")
+LATE_INTERACTION = ("pylate_compile_dynamic", "pylate_pack", "pylate_packed")
+SINGLE_VECTOR = ("st_compile_dynamic", "st_pack", "st_packed")
 MAIN_VARIANTS = (*LATE_INTERACTION, *SINGLE_VECTOR)
 
 PARITY_FAMILIES = {
-    "pylate_compile_dynamic": ("pylate_prepare", "pylate_packed"),
-    "st_compile_dynamic": ("st_prepare", "st_packed"),
+    "pylate_compile_dynamic": ("pylate_pack", "pylate_packed"),
+    "st_compile_dynamic": ("st_pack", "st_packed"),
 }
 
 ENDPOINTS = ("query", "document")
@@ -162,8 +162,8 @@ def _encode_st(model, tokenized: TokenizedTexts, batch_size: int):
 
 @torch.inference_mode()
 def _encode_st_packed(model, tokenized: TokenizedTexts, batch_size: int):
-    from flash_modernbert import forward
-    from flash_modernbert.config import ModernBertParams
+    from packed_encoders import forward
+    from packed_encoders.config import ModernBertParams
     from packed_collator import pack_sequences
 
     encoder = find_encoder(model)
@@ -381,11 +381,11 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             encoder.forward = torch.compile(
                 encoder.forward, mode="max-autotune", dynamic=True
             )
-        elif variant == "st_prepare":
+        elif variant == "st_pack":
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.prepare(
+            fm.pack(
                 model,
                 attention_backend="flash",
                 validate=False,
@@ -395,7 +395,7 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.prepare(
+            fm.pack(
                 model,
                 attention_backend="flash",
                 validate=False,
@@ -432,11 +432,11 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             encoder.forward = torch.compile(
                 encoder.forward, mode="max-autotune", dynamic=True
             )
-        elif variant == "pylate_prepare":
+        elif variant == "pylate_pack":
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.prepare(
+            fm.pack(
                 model,
                 attention_backend="flash",
                 validate=False,
@@ -446,7 +446,7 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.prepare(
+            fm.pack(
                 model,
                 attention_backend="flash",
                 validate=False,
@@ -622,7 +622,7 @@ def run(cfg: dict) -> dict:
                 env = os.environ.copy()
                 env["TORCHINDUCTOR_CACHE_DIR"] = str(cache_path)
                 env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
-                env["FLASH_MODERNBERT_DSL_CACHE"] = "0"
+                env["PACKED_ENCODERS_DSL_CACHE"] = "0"
                 command = [
                     sys.executable,
                     str(Path(__file__).resolve()),

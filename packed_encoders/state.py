@@ -1,6 +1,6 @@
-"""Per-model state attached by `prepare()`.
+"""Per-model state attached by `pack()`.
 
-`prepare()` patches in place, so the state hangs off the encoder module under one
+`pack()` patches in place, so the state hangs off the encoder module under one
 attribute. Keeping the original forward here makes the patch reversible and gives
 `validate()` an oracle (stock HF) to compare the fused path against even after the
 swap.
@@ -11,11 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.errors import FlashModernBertError
-from flash_modernbert.locate import find_encoder
+from packed_encoders.config import ModernBertParams
+from packed_encoders.errors import PackedEncodersError
+from packed_encoders.locate import find_encoder
 
-ATTR = "_flash_modernbert"
+ATTR = "_packed_encoders"
 
 
 @dataclass
@@ -32,11 +32,11 @@ class PatchState:
 
 
 def get_state(target: object) -> PatchState:
-    """Return the `PatchState` for an already-prepared target, or raise."""
+    """Return the `PatchState` for an already-patched target, or raise."""
     encoder = find_encoder(target)
     state = getattr(encoder, ATTR, None)
     if not isinstance(state, PatchState):
-        raise FlashModernBertError(
-            "this model has not been prepared with flash_modernbert.prepare()"
+        raise PackedEncodersError(
+            "this model has not been patched with packed_encoders.pack()"
         )
     return state

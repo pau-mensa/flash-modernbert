@@ -1,9 +1,9 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
-# dependencies = ["flash-modernbert", "transformers", "pytest"]
+# dependencies = ["packed-encoders", "transformers", "pytest"]
 #
 # [tool.uv.sources]
-# flash-modernbert = { path = "../", editable = true }
+# packed-encoders = { path = "../", editable = true }
 # torch = { index = "pytorch-cu128" }
 #
 # [[tool.uv.index]]
@@ -31,7 +31,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_modernbert import forward, ops
+from packed_encoders import forward, ops
 
 
 # --------------------------------------------------------------------------- #
@@ -118,15 +118,15 @@ needs_flash = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def models():
-    import flash_modernbert as fm
+    import packed_encoders as fm
     from transformers import AutoModel
 
     tok = __import__("transformers").AutoTokenizer.from_pretrained(MODEL_ID)
     stock = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
     flash = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
-    fm.prepare(flash, attention_backend="flash", validate=False)
+    fm.pack(flash, attention_backend="flash", validate=False)
     sdpa = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
-    fm.prepare(sdpa, attention_backend="sdpa", validate=False)
+    fm.pack(sdpa, attention_backend="sdpa", validate=False)
     return tok, stock, flash, sdpa
 
 
@@ -279,8 +279,8 @@ def test_packed_forward_entry_matches_hf(models, texts):
     will (real ids, `cu_seqlens`, per-sequence within-seq positions) and feeds it straight
     to `packed_forward`, returning `[total, H]` (no repad). This is the P0 forward-parity
     gate for the packed-paradigm showcase: loss-curve parity follows from it."""
-    from flash_modernbert.config import ModernBertParams
-    from flash_modernbert.locate import find_encoder
+    from packed_encoders.config import ModernBertParams
+    from packed_encoders.locate import find_encoder
 
     tok, stock, flash, sdpa = models
     enc = tok(texts, return_tensors="pt", padding="longest")
@@ -288,7 +288,7 @@ def test_packed_forward_entry_matches_hf(models, texts):
     am = enc["attention_mask"].cuda()
     b, s = ids.shape
 
-    # packed_forward reads weights straight off the live module — no prepare() needed,
+    # packed_forward reads weights straight off the live module — no pack() needed,
     # exactly how the showcase opts into the paradigm (the drop-in [B,S] forward is for
     # padded users; this is the explicit packed call).
     encoder = find_encoder(stock)

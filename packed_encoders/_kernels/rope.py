@@ -36,7 +36,7 @@ import torch
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
-from flash_modernbert._kernels._compile_cache import current_cute_stream, get_compiled
+from packed_encoders._kernels._compile_cache import current_cute_stream, get_compiled
 
 
 VEC = 8                  # 128-bit (8×bf16) coalesced loads/stores

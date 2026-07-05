@@ -2,7 +2,7 @@
 
 Pure-logic tests (no GPU / model / flash kernel needed): the `attention()` switch
 routes correctly, `"auto"` resolves by sequence length around `FLASH_MIN_SEQ`, and
-`prepare()`'s backend resolver raises for explicit `"flash"` without a kernel but
+`pack()`'s backend resolver raises for explicit `"flash"` without a kernel but
 downgrades `"auto"` to `"sdpa"`. The kernel call ABIs themselves are exercised on
 GPU elsewhere (cute on B200/H200, compiled on sm_120)."""
 
@@ -11,12 +11,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flash_modernbert import ops
-from flash_modernbert.errors import FlashModernBertError
-from flash_modernbert.prepare import (
+from packed_encoders import ops
+from packed_encoders.errors import PackedEncodersError
+from packed_encoders.pack import (
     _default_backend,
     _resolve_attention_backend,
-    prepare,
+    pack,
 )
 
 
@@ -66,13 +66,13 @@ def test_resolve_flash_absent(monkeypatch):
     assert _resolve_attention_backend("sdpa") == "sdpa"  # never touches flash
     with pytest.warns(UserWarning):
         assert _resolve_attention_backend("auto") == "sdpa"  # graceful downgrade
-    with pytest.raises(FlashModernBertError):
+    with pytest.raises(PackedEncodersError):
         _resolve_attention_backend("flash")  # explicit -> hard error
 
 
-def test_prepare_rejects_unknown_backend():
-    with pytest.raises(FlashModernBertError):
-        prepare(object(), attention_backend="bogus")
+def test_pack_rejects_unknown_backend():
+    with pytest.raises(PackedEncodersError):
+        pack(object(), attention_backend="bogus")
 
 
 def test_flash_min_seq_is_arch_keyed(monkeypatch):

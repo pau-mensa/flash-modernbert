@@ -1,4 +1,4 @@
-"""Shared helpers for the flash-modernbert showcase scripts (Workstream F).
+"""Shared helpers for the packed-encoders showcase scripts (Workstream F).
 
 Kept dependency-light: yaml config loading, the AgentIR passage-corpus loader
 (F2's real long-document corpus), a token-length profiler, and small plotting

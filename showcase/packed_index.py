@@ -1,6 +1,6 @@
 """End-to-end ColBERT encoding structures for the packed-inference showcase.
 
-This is showcase scaffolding, not part of the ``flash_modernbert`` package.  It
+This is showcase scaffolding, not part of the ``packed_encoders`` package.  It
 keeps the comparison explicit:
 
 * ``encode_padded``: rectangular encoder batches and a rectangular token index.
@@ -21,9 +21,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flash_modernbert import forward
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.locate import find_encoder
+from packed_encoders import forward
+from packed_encoders.config import ModernBertParams
+from packed_encoders.locate import find_encoder
 
 from packed_collator import pack_sequences
 

@@ -28,16 +28,16 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from flash_modernbert import forward, ops
-from flash_modernbert.config import ModernBertParams
-from flash_modernbert.locate import find_encoder
-from flash_modernbert.state import get_state
+from packed_encoders import forward, ops
+from packed_encoders.config import ModernBertParams
+from packed_encoders.locate import find_encoder
+from packed_encoders.state import get_state
 
-GRAPH_ENV_VAR = "FLASH_MODERNBERT_GRAPH"
+GRAPH_ENV_VAR = "PACKED_ENCODERS_GRAPH"
 
 
 def graphs_globally_disabled() -> bool:
-    """The `FLASH_MODERNBERT_GRAPH=0` kill switch."""
+    """The `PACKED_ENCODERS_GRAPH=0` kill switch."""
     return os.environ.get(GRAPH_ENV_VAR, "1") == "0"
 
 
@@ -51,7 +51,7 @@ class GraphConfig:
       its own graph; set, every `b <= max_batch` replays one padded `max_batch`-row
       graph (the first `b` rows sliced out) and `b > max_batch` falls back to eager —
       the strongest cache bound for variable-batch workloads (e.g. partial last batch).
-    - `seq_buckets` (with `max_batch`) pre-captures those buckets at `prepare()` time
+    - `seq_buckets` (with `max_batch`) pre-captures those buckets at `pack()` time
       instead of lazily.
     - `max_graphs` bounds the cache by LRU eviction; a shape over `max_tokens` is
       never captured.
@@ -382,7 +382,7 @@ def build_runner(
     if config.seq_buckets:
         if config.max_batch is None:
             warnings.warn(
-                "flash-modernbert: GraphConfig.seq_buckets needs max_batch to know "
+                "packed-encoders: GraphConfig.seq_buckets needs max_batch to know "
                 "the batch dimension to pre-capture at; skipping pre-capture (graphs "
                 "will still be captured lazily on first sight).",
                 stacklevel=2,
@@ -398,7 +398,7 @@ def build_runner(
 
 
 def set_cuda_graph(model: object, enabled: bool, *, config: GraphConfig | None = None) -> None:
-    """Turn the graph layer on or off after `prepare()`. Building a runner the
+    """Turn the graph layer on or off after `pack()`. Building a runner the
     first time it is enabled requires CUDA and is lazy per shape."""
     state = get_state(model)
     if enabled and state.graph_runner is None:

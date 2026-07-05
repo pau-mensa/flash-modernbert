@@ -8,13 +8,13 @@ ones. Every refusal is one of these, never a quiet downgrade.
 from __future__ import annotations
 
 
-class FlashModernBertError(Exception):
+class PackedEncodersError(Exception):
     """Base class for every error this package raises."""
 
 
-class UnsupportedTargetError(FlashModernBertError):
-    """`prepare()` could not locate a ModernBERT encoder inside the target."""
+class UnsupportedTargetError(PackedEncodersError):
+    """`pack()` could not locate a ModernBERT encoder inside the target."""
 
 
-class ValidationError(FlashModernBertError):
+class ValidationError(PackedEncodersError):
     """A `validate()` gate failed — the fused path was refused."""
