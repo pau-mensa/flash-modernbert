@@ -62,7 +62,7 @@ device would mean *wrong embeddings*, not just slower ones. It checks:
 
 ## Requirements
 
-- An NVIDIA GPU of compute capability sm_90, sm_100, or sm_120, with a working
+- An NVIDIA GPU of compute capability sm_80, sm_89, sm_90, sm_100, or sm_120, with a working
   `ptxas` (CuteDSL JIT-compiles at runtime).
 - bf16 weights for inference, or fp32 master weights under bf16 autocast for
   training.

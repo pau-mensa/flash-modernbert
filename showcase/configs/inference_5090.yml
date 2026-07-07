@@ -5,9 +5,11 @@ models:
   document_length: 2048
 
 variants:
+  - pylate_eager
   - pylate_compile_dynamic
   - pylate_pack
   - pylate_packed
+  - st_eager
   - st_compile_dynamic
   - st_pack
   - st_packed

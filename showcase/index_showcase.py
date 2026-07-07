@@ -15,10 +15,10 @@
 # ///
 """Long-document indexing comparison on Tevatron/AgentIR-data.
 
-The ST lane is a pooled-vector deployment control.  The three PyLate bars are
-the causal comparison: strongest compiled padded encoder, drop-in pack with
-a padded index, and a fully packed encoder/index.  MaxSim is intentionally out
-of scope: indexing only creates document representations.
+The ST lane is a pooled-vector deployment control.  The four bars in each lane
+compare eager stock, the strongest compiled padded encoder, drop-in pack with a
+padded index, and a fully packed encoder/index.  MaxSim is intentionally out of
+scope: indexing only creates document representations.
 """
 
 from __future__ import annotations
@@ -54,18 +54,23 @@ from packed_index import (
 
 # Grouped by the two figures the showcase produces.  Late interaction (PyLate)
 # emits one embedding per retained document token; single vector (ST) emits one
-# pooled embedding per document.  Within each family the three bars are the same
-# comparison: strongest compiled stock encoder, drop-in `fm.pack` padded, and
-# a fully packed encoder/index.
-LATE_INTERACTION = ("pylate_compile_dynamic", "pylate_pack", "pylate_packed")
-SINGLE_VECTOR = ("st_compile_dynamic", "st_pack", "st_packed")
+# pooled embedding per document.  Within each family the four bars are the same
+# comparison: eager stock, strongest compiled stock encoder, drop-in `fm.pack`
+# padded, and a fully packed encoder/index.
+LATE_INTERACTION = (
+    "pylate_eager",
+    "pylate_compile_dynamic",
+    "pylate_pack",
+    "pylate_packed",
+)
+SINGLE_VECTOR = ("st_eager", "st_compile_dynamic", "st_pack", "st_packed")
 MAIN_VARIANTS = (*LATE_INTERACTION, *SINGLE_VECTOR)
 VARIANTS = (*MAIN_VARIANTS, "st_compile", "pylate_compile")
 
 # For each model family, the reference variant that parity candidates must match.
 PARITY_FAMILIES = {
-    "pylate_compile_dynamic": ("pylate_pack", "pylate_packed"),
-    "st_compile_dynamic": ("st_pack", "st_packed"),
+    "pylate_eager": ("pylate_compile_dynamic", "pylate_pack", "pylate_packed"),
+    "st_eager": ("st_compile_dynamic", "st_pack", "st_packed"),
 }
 
 
@@ -357,7 +362,13 @@ def _build_variant(variant: str, cfg: dict, docs: list[str]):
     buckets = [int(x) for x in bench.get("length_buckets", [256, 512, 1024, 2048])]
     load_start = time.perf_counter()
 
-    if variant in ("st_compile", "st_compile_dynamic", "st_pack", "st_packed"):
+    if variant in (
+        "st_eager",
+        "st_compile",
+        "st_compile_dynamic",
+        "st_pack",
+        "st_packed",
+    ):
         from sentence_transformers import SentenceTransformer
 
         model_name = models_cfg.get("sentence_transformers", "answerdotai/ModernBERT-base")
@@ -419,7 +430,9 @@ def _build_variant(variant: str, cfg: dict, docs: list[str]):
                 batch_size=batch_size,
                 sort_by_length=True,
                 length_buckets=(
-                    None if variant == "pylate_compile_dynamic" else buckets
+                    None
+                    if variant in ("pylate_eager", "pylate_compile_dynamic")
+                    else buckets
                 ),
             )
     return model_name, model, tokens, build, model_load_s, tokenization_s
@@ -484,10 +497,10 @@ def _worker(variant: str, cfg: dict, docs: list[str], result_path: Path) -> None
 
 
 def _parity(results: dict[str, dict]) -> dict:
-    """Gate each family's patched/packed variants against its compiled reference.
+    """Gate each family's compiled/patched/packed variants against eager stock.
 
     Both the late-interaction (per-token) and single-vector (pooled) families are
-    checked when present, each against its own stock compiled encoder.
+    checked when present, each against its own unmodified eager encoder.
     """
     output = {}
     for reference_label, candidates in PARITY_FAMILIES.items():

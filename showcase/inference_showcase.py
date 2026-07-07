@@ -13,7 +13,7 @@
 # url = "https://download.pytorch.org/whl/cu128"
 # explicit = true
 # ///
-"""Serving-throughput comparison: compiled stock vs fm.pack vs packed.
+"""Serving-throughput comparison: eager/compiled stock vs fm.pack vs packed.
 
 Two endpoints, measured independently in process-isolated workers:
 
@@ -23,8 +23,9 @@ Two endpoints, measured independently in process-isolated workers:
 * **Document endpoint** -- long sequences (S~512-2048).  No graphs: compute-
   bound, varlen attention is the lever.
 
-Three variants per model family (late interaction / single vector):
+Four variants per model family (late interaction / single vector):
 
+* Eager stock: unmodified dynamically padded encoder.
 * Compiled stock (``max-autotune``, ``dynamic=True``): strongest deployer
   baseline.
 * ``fm.pack`` (flash attention; +CUDA graph on query endpoint): drop-in.
@@ -71,13 +72,18 @@ from packed_index import (
 )
 
 
-LATE_INTERACTION = ("pylate_compile_dynamic", "pylate_pack", "pylate_packed")
-SINGLE_VECTOR = ("st_compile_dynamic", "st_pack", "st_packed")
+LATE_INTERACTION = (
+    "pylate_eager",
+    "pylate_compile_dynamic",
+    "pylate_pack",
+    "pylate_packed",
+)
+SINGLE_VECTOR = ("st_eager", "st_compile_dynamic", "st_pack", "st_packed")
 MAIN_VARIANTS = (*LATE_INTERACTION, *SINGLE_VECTOR)
 
 PARITY_FAMILIES = {
-    "pylate_compile_dynamic": ("pylate_pack", "pylate_packed"),
-    "st_compile_dynamic": ("st_pack", "st_packed"),
+    "pylate_eager": ("pylate_compile_dynamic", "pylate_pack", "pylate_packed"),
+    "st_eager": ("st_compile_dynamic", "st_pack", "st_packed"),
 }
 
 ENDPOINTS = ("query", "document")
