@@ -17,6 +17,8 @@ from packed_encoders._kernels.geglu import (
     geglu_bwd as _geglu_bwd_kernel,
 )
 from packed_encoders._kernels.layer_norm import (
+    add_layer_norm as _add_ln_kernel,
+    add_layer_norm_with_stats as _add_ln_kernel_with_stats,
     layer_norm as _ln_kernel,
     layer_norm_with_stats as _ln_kernel_with_stats,
 )
@@ -90,6 +92,100 @@ class _LayerNormFn(torch.autograd.Function):
             [True, True, False],
         )
         return grad_input, grad_weight, None
+
+
+class _AddLayerNormFn(torch.autograd.Function):
+    """Two-input/two-output residual-add+LN autograd boundary.
+
+    Returning ``x_new`` as well as the normalized value lets the encoder carry the
+    residual stream without redoing the add.  Backward folds ``grad_x_new`` into the
+    LN input gradient and returns that same combined gradient to both add inputs.
+    """
+
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16)
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ):
+        x_d = x.detach()
+        residual_d = residual.detach()
+        w_d = weight.detach()
+        h = x_d.shape[-1]
+        use_cute = (
+            x_d.is_cuda
+            and x_d.dtype == torch.bfloat16
+            and residual_d.dtype == torch.bfloat16
+            and w_d.dtype == torch.bfloat16
+            and h % 256 == 0
+        )
+        if use_cute:
+            x_new, y, mean, rstd = _add_ln_kernel_with_stats(
+                x_d, residual_d, w_d, eps
+            )
+        else:
+            # This add intentionally happens in the (possibly autocast-forced) input
+            # dtype so LN sees the same rounded residual stream as stock ModernBERT.
+            x_new = x_d + residual_d
+            y_aten, mean, rstd = torch.ops.aten.native_layer_norm.default(
+                x_new, (h,), w_d, None, eps
+            )
+            cute_fwd_ok = (
+                x_d.is_cuda
+                and h % 32 == 0
+                and x_d.dtype == residual_d.dtype == w_d.dtype == torch.bfloat16
+            )
+            y = (
+                _add_ln_kernel(x_d, residual_d, w_d, eps)[1]
+                if cute_fwd_ok
+                else y_aten
+            )
+        # Save a detached alias: returning ``x_new`` makes autograd attach this
+        # Function's grad_fn to that output tensor, which DLPack correctly refuses
+        # to export from backward.
+        ctx.save_for_backward(x_new.detach(), w_d, mean, rstd)
+        ctx.normalized_shape = (h,)
+        ctx.use_cute = use_cute
+        return x_new, y
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(
+        ctx, grad_x_new: torch.Tensor, grad_out: torch.Tensor
+    ):
+        x_new, weight, mean, rstd = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        grad_x_new = grad_x_new.contiguous()
+        if ctx.use_cute and grad_out.dtype == grad_x_new.dtype == torch.bfloat16:
+            grad_input, grad_weight = _ln_bwd_dyn_kernel(
+                grad_out,
+                x_new,
+                mean,
+                rstd,
+                weight,
+                inplace=False,
+                grad_residual=grad_x_new,
+            )
+        else:
+            mean_a = mean.reshape(*x_new.shape[:-1], 1)
+            rstd_a = rstd.reshape(*x_new.shape[:-1], 1)
+            grad_input, grad_weight, _ = (
+                torch.ops.aten.native_layer_norm_backward.default(
+                    grad_out,
+                    x_new,
+                    ctx.normalized_shape,
+                    mean_a,
+                    rstd_a,
+                    weight,
+                    None,
+                    [True, True, False],
+                )
+            )
+            grad_input = grad_input + grad_x_new
+        return grad_input, grad_input, grad_weight, None
 
 
 def fused_layer_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -208,31 +304,19 @@ def fused_add_layer_norm(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused ``x_new = x + residual; y = LN(x_new)`` → ``(x_new, y)``."""
-    if torch.is_grad_enabled() and (x.requires_grad or residual.requires_grad):
-        x_new = x + residual
-        return x_new, fused_layer_norm(x_new, weight, eps)
+    if torch.is_autocast_enabled("cuda") or (
+        torch.is_grad_enabled()
+        and (x.requires_grad or residual.requires_grad or weight.requires_grad)
+    ):
+        return _AddLayerNormFn.apply(x, residual, weight, eps)
     from packed_encoders._kernels.triton_layer_norm import add_layer_norm
 
     return add_layer_norm(x.detach(), residual.detach(), weight.detach(), eps)
 
 
-def ln_linear(x, weight, gamma, eps):
-    return _linear(fused_layer_norm(x, gamma, eps), weight)
-
-
-def add_ln_linear(x, residual, weight, gamma, eps):
-    """Fused residual-add + LN + linear: ``LN(x + residual) @ W^T``."""
-    x_new, normed = fused_add_layer_norm(x, residual, gamma, eps)
-    return x_new, _linear(normed, weight)
-
-
 def geglu_mlp(x, w_in, w_out):
     proj = _linear(x, w_in)
     return _linear(fused_geglu(proj), w_out)
-
-
-def geglu_mlp_pre_ln(x, w_in, w_out, gamma, eps):
-    return geglu_mlp(fused_layer_norm(x, gamma, eps), w_in, w_out)
 
 
 # ---------------------------------------------------------------------------

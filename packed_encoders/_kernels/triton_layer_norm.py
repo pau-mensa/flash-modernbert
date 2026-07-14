@@ -25,34 +25,11 @@ import triton.language as tl
 
 @triton.jit
 def _ln_fwd_kernel(
-    X, W, Y,
-    stride_x,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    eps,
-):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_H)
-    mask = cols < H
-
-    x = tl.load(X + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-
-    mean = tl.sum(x, axis=0) / H
-    xc = x - mean
-    var = tl.sum(xc * xc, axis=0) / H
-    inv_std = tl.math.rsqrt(var + eps)
-
-    y = (xc * inv_std * w).to(Y.dtype.element_ty)
-    tl.store(Y + row * stride_x + cols, y, mask=mask)
-
-
-@triton.jit
-def _add_ln_fwd_kernel(
     X, RESIDUAL, W, Y, X_OUT,
     stride_x,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
     eps,
 ):
     row = tl.program_id(0)
@@ -60,15 +37,22 @@ def _add_ln_fwd_kernel(
     mask = cols < H
 
     x = tl.load(X + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
-    res = tl.load(RESIDUAL + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        residual = tl.load(
+            RESIDUAL + row * stride_x + cols, mask=mask, other=0.0
+        ).to(tl.float32)
+        # Preserve HF's bf16 residual-add rounding boundary before LN statistics.
+        x = (x + residual).to(X.dtype.element_ty)
+        tl.store(X_OUT + row * stride_x + cols, x, mask=mask)
+        x = x.to(tl.float32)
     w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
 
-    x_new = x + res
-    tl.store(X_OUT + row * stride_x + cols, x_new.to(X.dtype.element_ty), mask=mask)
-
-    mean = tl.sum(x_new, axis=0) / H
-    xc = x_new - mean
-    var = tl.sum(xc * xc, axis=0) / H
+    mean = tl.sum(x, axis=0) / H
+    xc = x - mean
+    # Match the Cute kernel / native bf16 LayerNorm reduction.  The centered-square
+    # form is mathematically equivalent but differs enough in reduction rounding to
+    # amplify across 22 residual layers at short sequence lengths.
+    var = tl.sum(x * x, axis=0) / H - mean * mean
     inv_std = tl.math.rsqrt(var + eps)
 
     y = (xc * inv_std * w).to(Y.dtype.element_ty)
@@ -105,10 +89,11 @@ def layer_norm(
     n_rows = flat.shape[0]
     block_h = triton.next_power_of_2(h)
     _ln_fwd_kernel[(n_rows,)](
-        flat, weight, out,
+        flat, flat, weight, out, flat,
         flat.stride(0),
         H=h,
         BLOCK_H=block_h,
+        HAS_RESIDUAL=False,
         eps=eps,
     )
     return out.view(x.shape)
@@ -129,11 +114,12 @@ def add_layer_norm(
     y = torch.empty_like(flat_x)
     n_rows = flat_x.shape[0]
     block_h = triton.next_power_of_2(h)
-    _add_ln_fwd_kernel[(n_rows,)](
+    _ln_fwd_kernel[(n_rows,)](
         flat_x, flat_res, weight, y, x_out,
         flat_x.stride(0),
         H=h,
         BLOCK_H=block_h,
+        HAS_RESIDUAL=True,
         eps=eps,
     )
     return x_out.view(x.shape), y.view(x.shape)

@@ -8,6 +8,10 @@ Inputs: grad_ln_x [M,K] bf16 (grad wrt LN output), x [M,K] bf16 (saved input),
 mean/rstd [M] fp32 (saved per-row stats), γ [K] bf16. Outputs grad_x [M,K] bf16
 and grad_γ [K] bf16 (summed from per-CTA fp32 partials).
 
+The residual-add specialization also accepts the direct gradient of the returned
+``x_new`` output and accumulates it into grad_x before the bf16 store.  The combined
+gradient is shared by both inputs of the residual add by the autograd wrapper.
+
 With `inplace=True`, grad_x is written over grad_ln_x's storage (per-thread
 read-then-write at the same cell, race-free), saving an [M,K] tensor — the
 bwd-peak win that unblocks large training batches.
@@ -41,7 +45,7 @@ NUM_THREADS = NUM_WARPS * WARP_SIZE  # 256
 BM_BAND = NUM_WARPS  # one warp per row in the band
 
 
-def _build_dyn(k: int, n_sm: int):
+def _build_dyn(k: int, n_sm: int, *, has_residual_grad: bool):
     assert k % WARP_SIZE == 0, f"K={k} must be a multiple of warp size {WARP_SIZE}"
     assert k % NUM_THREADS == 0, (
         f"K={k} must be a multiple of NUM_THREADS={NUM_THREADS} for the "
@@ -54,6 +58,7 @@ def _build_dyn(k: int, n_sm: int):
     @cute.kernel
     def kernel(
         g_grad_in: cute.Tensor,  # [M, K] bf16  grad wrt LN output
+        g_grad_residual: cute.Tensor,  # [M, K] bf16 direct grad wrt x_new
         g_grad_x: cute.Tensor,  # [M, K] bf16  output (may alias g_grad_in)
         g_x: cute.Tensor,  # [M, K] bf16
         g_mean: cute.Tensor,  # [M]    fp32
@@ -129,6 +134,12 @@ def _build_dyn(k: int, n_sm: int):
                 for ki in cutlass.range_constexpr(elems_per_thread):
                     col = lane_id + Int32(ki * WARP_SIZE)
                     gx = (grad_z_local[ki] - c1 - c2 * z_local[ki]) * rstd_val
+                    if has_residual_grad:
+                        # Match eager bf16 autograd accumulation: LN's bf16 input
+                        # gradient is rounded before the direct residual gradient is
+                        # accumulated into it.
+                        gx = g_grad_x.element_type(gx).to(Float32)
+                        gx = gx + g_grad_residual[m_row, col].to(Float32)
                     g_grad_x[m_row, col] = g_grad_x.element_type(gx)
 
             band_iter = band_iter + grid_x
@@ -149,6 +160,7 @@ def _build_dyn(k: int, n_sm: int):
     @cute.jit
     def launch(
         GradIn: cute.Tensor,
+        GradResidual: cute.Tensor,
         GradX: cute.Tensor,
         X: cute.Tensor,
         Mean: cute.Tensor,
@@ -158,7 +170,17 @@ def _build_dyn(k: int, n_sm: int):
         stream: cuda_driver.CUstream,
     ):
         m = cute.size(X, mode=[0])
-        kernel(GradIn, GradX, X, Mean, Rstd, Gamma, GradGammaPartials, m).launch(
+        kernel(
+            GradIn,
+            GradResidual,
+            GradX,
+            X,
+            Mean,
+            Rstd,
+            Gamma,
+            GradGammaPartials,
+            m,
+        ).launch(
             grid=(n_sm, 1, 1),
             block=(NUM_THREADS, 1, 1),
             smem=(NUM_WARPS * k * 4 + 1024) & ~127,
@@ -168,13 +190,15 @@ def _build_dyn(k: int, n_sm: int):
     return launch
 
 
-_compiled_dyn: dict[tuple[int, int], object] = {}
+_compiled_dyn: dict[tuple[int, int, bool], object] = {}
 
 
-def _get_jit_dyn(k: int, n_sm: int):
-    key = (k, n_sm)
+def _get_jit_dyn(k: int, n_sm: int, *, has_residual_grad: bool):
+    key = (k, n_sm, has_residual_grad)
     if key not in _compiled_dyn:
-        _compiled_dyn[key] = _build_dyn(k, n_sm)
+        _compiled_dyn[key] = _build_dyn(
+            k, n_sm, has_residual_grad=has_residual_grad
+        )
     return _compiled_dyn[key]
 
 
@@ -186,12 +210,14 @@ def ln_bwd(
     gamma: torch.Tensor,
     *,
     inplace: bool = False,
+    grad_residual: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """LayerNorm backward (no β). See the module docstring for the math and layout.
 
-    grad_ln_x / x: [..., K] bf16; mean, rstd: flat [M] fp32; gamma: [K] bf16. With
-    `inplace=True`, grad_x is written over grad_ln_x's storage (caller must own it).
-    Returns `(grad_x, grad_gamma)`; grad_gamma is freshly allocated bf16.
+    grad_ln_x / x: [..., K] bf16; mean, rstd: flat [M] fp32; gamma: [K] bf16.
+    ``grad_residual`` is the optional direct gradient of the fused op's ``x_new``
+    output. With `inplace=True`, grad_x is written over grad_ln_x's storage (caller
+    must own it). Returns `(grad_x, grad_gamma)`; grad_gamma is freshly allocated bf16.
     """
     assert grad_ln_x.is_cuda and x.is_cuda and mean.is_cuda and rstd.is_cuda
     assert gamma.is_cuda
@@ -200,9 +226,15 @@ def ln_bwd(
 
     K = gamma.shape[0]
     flat_grad = grad_ln_x.reshape(-1, K)
+    flat_grad_residual = (
+        flat_grad if grad_residual is None else grad_residual.reshape(-1, K)
+    )
     flat_x = x.reshape(-1, K)
     assert flat_grad.is_contiguous() and flat_x.is_contiguous()
     assert flat_grad.shape == flat_x.shape
+    assert flat_grad_residual.is_contiguous()
+    assert flat_grad_residual.shape == flat_grad.shape
+    assert flat_grad_residual.dtype == flat_grad.dtype
     M = flat_grad.shape[0]
     assert mean.shape == (M,) and rstd.shape == (M,)
 
@@ -213,9 +245,13 @@ def ln_bwd(
         (n_sm, K), dtype=torch.float32, device=grad_ln_x.device
     )
 
-    launcher = _get_jit_dyn(K, n_sm)
+    has_residual_grad = grad_residual is not None
+    launcher = _get_jit_dyn(
+        K, n_sm, has_residual_grad=has_residual_grad
+    )
     args = (
         from_dlpack(flat_grad, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+        from_dlpack(flat_grad_residual, assumed_align=16).mark_layout_dynamic(leading_dim=1),
         from_dlpack(flat_out, assumed_align=16).mark_layout_dynamic(leading_dim=1),
         from_dlpack(flat_x, assumed_align=16).mark_layout_dynamic(leading_dim=1),
         from_dlpack(mean, assumed_align=16).mark_layout_dynamic(),
@@ -224,7 +260,9 @@ def ln_bwd(
         from_dlpack(grad_gamma_partials, assumed_align=16),
         current_cute_stream(),
     )
-    compiled = get_compiled(launcher, args, key=("ln_bwd_dyn", K, n_sm))
+    compiled = get_compiled(
+        launcher, args, key=("ln_bwd_dyn", K, n_sm, has_residual_grad)
+    )
     compiled(*args)
 
     grad_gamma = grad_gamma_partials.sum(dim=0).to(torch.bfloat16)

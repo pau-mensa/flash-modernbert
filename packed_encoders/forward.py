@@ -160,6 +160,7 @@ def _layer_is_global(
 
 def _encoder_layer(
     x: Tensor,
+    pending_residual: Tensor | None,
     layer: nn.Module,
     params: ModernBertParams,
     cos: Tensor,
@@ -169,15 +170,25 @@ def _encoder_layer(
     backend: str,
     cu_seqlens: Tensor | None = None,
     max_seqlen: int | None = None,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     b, s = x.shape[:2]
     h, d = params.num_attention_heads, params.head_dim
 
     attn_norm = layer.attn_norm
     if isinstance(attn_norm, nn.Identity):
+        # ModernBERT uses Identity only for layer 0, before any residual is pending.
+        # Keep this defensive fallback correct for architecture variants.
+        if pending_residual is not None:
+            x = x + pending_residual
         qkv = F.linear(x, layer.attn.Wqkv.weight, None)
     else:
-        qkv = ops.ln_linear(x, layer.attn.Wqkv.weight, attn_norm.weight, attn_norm.eps)
+        if pending_residual is None:
+            normed = ops.fused_layer_norm(x, attn_norm.weight, attn_norm.eps)
+        else:
+            x, normed = ops.fused_add_layer_norm(
+                x, pending_residual, attn_norm.weight, attn_norm.eps
+            )
+        qkv = ops._linear(normed, layer.attn.Wqkv.weight)
 
     if ops.use_bshd_rope_flash(backend, s, h, d, cu_seqlens):
         # Inference flash fast path: RoPE reads the packed qkv and hands flash its native
@@ -207,8 +218,12 @@ def _encoder_layer(
     x, normed = ops.fused_add_layer_norm(
         x, wo_out, mlp_norm.weight, mlp_norm.eps
     )
-    x = x + ops.geglu_mlp(normed, layer.mlp.Wi.weight, layer.mlp.Wo.weight)
-    return x
+    # Do not materialize this residual add.  The next layer's attn_norm (or the
+    # model's final_norm) consumes it in its fused add+LN kernel.
+    pending_residual = ops.geglu_mlp(
+        normed, layer.mlp.Wi.weight, layer.mlp.Wo.weight
+    )
+    return x, pending_residual
 
 
 def core(
@@ -234,13 +249,15 @@ def core(
     half = params.sliding_half_window
     global_window = (-1, -1)
     local_window = (half, half)
+    pending_residual = None
     for layer_idx, layer in enumerate(model.layers):
         if _layer_is_global(layer, layer_idx, params):
             cos, sin, mask, window = cos_global, sin_global, full_mask, global_window
         else:
             cos, sin, mask, window = cos_local, sin_local, sliding_mask, local_window
-        x = _encoder_layer(
+        x, pending_residual = _encoder_layer(
             x,
+            pending_residual,
             layer,
             params,
             cos,
@@ -252,7 +269,12 @@ def core(
             max_seqlen=max_seqlen,
         )
     final_norm = model.final_norm
-    return ops.fused_layer_norm(x, final_norm.weight, final_norm.eps)
+    if pending_residual is None:
+        return ops.fused_layer_norm(x, final_norm.weight, final_norm.eps)
+    _, out = ops.fused_add_layer_norm(
+        x, pending_residual, final_norm.weight, final_norm.eps
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
