@@ -1,13 +1,17 @@
 """Triton LayerNorm forward — inference-only replacement for the CuTe DSL
 variant when CuTe dispatch overhead dominates (small M, large H).
 
-The CuTe DSL GPU kernel beats ATen (4.2 µs vs 6.8 µs at M=2048 H=768),
-but each CuTe call pays ~10 µs of from_dlpack + stream wrapping that
-PyTorch's C++ dispatch avoids. Triton sits in between: ~1 µs dispatch,
-same GPU kernel quality. This kernel exists so the inference path gets
-the fast kernel without the slow wrapper.
+On RTX 5090 at bf16 H=768, Triton is faster both at the public wrapper and on
+the GPU: at M=8192 the measured kernel durations are ~6.1 µs Triton vs ~9.4 µs
+CuteDSL, while wrapper floors at small M are ~10.4 µs vs ~14.7 µs. The kernels
+converge once memory-bandwidth-saturated, but CuteDSL has no repeatable crossover
+through M=262,144. That result motivated the cross-architecture calibration below.
 
-Training (backward, autocast stats) stays on CuTe DSL — the backward's
+Cross-architecture Modal calibration found no LayerNorm crossover on A100, L40S,
+or B200 either. GeGLU is different: its stats-free CuteDSL kernel crosses Triton
+at M=16,384 on L40S and a conservative M=24,576 on B200; A100 has no crossover.
+
+Training (backward stats) stays on CuTe DSL — the backward's
 persistent-CTA layout and grad_gamma partials are more complex than a
 simple Triton kernel, and the training path is not launch-bound.
 """

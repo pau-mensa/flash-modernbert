@@ -1,9 +1,10 @@
 """Skip CuteDSL's ~10 ms per-call dispatch by caching compiled functions.
 
-Calling a `@cute.jit` launcher pays ~10 ms of host-side dispatch on every call, even
-when the cubin is cached. `launcher(*args, compile_only=True)` returns a
-`JitCompiledFunction` whose `__call__` skips that (~7 µs). This module caches those,
-keyed by a caller-declared compilation signature (the baked-in shape dims + dtypes).
+Calling a `@cute.jit` launcher pays milliseconds of host-side dispatch on every call,
+even when the cubin is cached. `launcher(*args, compile_only=True)` returns a
+`JitCompiledFunction` whose `__call__` skips that repeated JIT dispatch. This module
+caches those, keyed by a caller-declared compilation signature (the baked-in shape
+dims + dtypes).
 
 `current_cute_stream()` wraps the current PyTorch CUDA stream as a `CUstream` so kernels
 launch on the captured stream during `torch.cuda.graph(...)`. Without it they default to
@@ -43,7 +44,7 @@ def get_compiled(launcher, args: tuple, key) -> Any:
     First call with a new (launcher, key) compiles + caches. Subsequent calls return the
     cached callable. The caller calls the result with the same args shape they passed here.
 
-    Default path returns a `JitCompiledFunction` (fast ~7 µs dispatch, no disk cache).
+    Default path returns a fast-dispatch `JitCompiledFunction` (no disk cache).
     With `PACKED_ENCODERS_DSL_CACHE=1`, returns a `_FileCacheDispatch` wrapper that engages
     CuteDSL's persistent disk cache on first use (see module docstring).
     """
@@ -137,7 +138,7 @@ class _FileCacheDispatch:
 
     First call routes through CuteDSL's normal path (engages the persistent disk
     file cache + executes once + captures the compiled fn); subsequent calls use
-    the captured fn's fast ~15 µs dispatch.
+    the captured function's fast dispatch.
     """
 
     __slots__ = ("_launcher", "_fn")
