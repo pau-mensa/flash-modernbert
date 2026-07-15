@@ -40,10 +40,10 @@ from packed_encoders import forward, ops
 
 
 def test_resolve_eager_backend():
-    assert forward._resolve_eager_backend("sdpa", 99999) == "sdpa"
-    assert forward._resolve_eager_backend("flash", 1) == "flash"
-    assert forward._resolve_eager_backend("auto", ops.FLASH_MIN_SEQ - 1) == "sdpa"
-    assert forward._resolve_eager_backend("auto", ops.FLASH_MIN_SEQ) == "flash"
+    assert forward._resolve_eager_backend("sdpa") == "sdpa"
+    assert forward._resolve_eager_backend("flash") == "flash"
+    # An unresolved auto is capture/CPU-safe SDPA, never an S-length decision.
+    assert forward._resolve_eager_backend("auto") == "sdpa"
 
 
 def test_has_padding():
@@ -157,6 +157,41 @@ def test_varlen_flash_matches_hf_on_padded_batch(models, texts):
     assert _masked_cos(out_flash, ref, am) > 0.997
     # ...and agrees with the sdpa fused path (the dep-free padded reference).
     assert _masked_cos(out_flash, out_sdpa, am) > 0.997
+
+
+@needs_flash
+def test_5090_auto_routes_by_distribution_score(models, monkeypatch):
+    """Exercise the real eager boundary on the card used for score calibration."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("the first distribution score is calibrated only for sm_120")
+
+    _tok, _stock, model, _sdpa = models
+    state = getattr(model, forward.ATTR)
+    original_core = forward.core
+    routes = []
+
+    def recording_core(*args, **kwargs):
+        routes.append(kwargs.get("backend", "sdpa"))
+        return original_core(*args, **kwargs)
+
+    monkeypatch.setattr(forward, "core", recording_core)
+    cases = [
+        ((1024,), "sdpa"),                 # long but too little aggregate work
+        ((1024, 1024), "flash"),           # same S, enough aggregate work
+        ((64,) * 64, "sdpa"),              # deliberately omitted ~1-2% boundary win
+        ((64, 32) * 32, "flash"),          # same padded shape, padding credits varlen
+    ]
+    for lengths, expected in cases:
+        b, s = len(lengths), max(lengths)
+        ids = torch.randint(5, model.config.vocab_size, (b, s), device="cuda")
+        lens = torch.tensor(lengths, device="cuda").unsqueeze(1)
+        mask = (torch.arange(s, device="cuda").unsqueeze(0) < lens).long()
+        routes.clear()
+        with torch.inference_mode():
+            forward.fused_forward(
+                model, state.params, ids, mask, backend="auto"
+            )
+        assert routes == [expected]
 
 
 def _grad_cos(a: torch.Tensor, b: torch.Tensor) -> float:

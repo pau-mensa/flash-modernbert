@@ -60,8 +60,9 @@ def pack(
     - `"flash"` — FlashAttention with sliding-window pruning; on a padded batch it
       uses the varlen kernel. Needs a kernel (FA4-cute on sm_90/sm_100, compiled
       flash-attn on sm_120); raises if none is present.
-    - `"auto"` — sdpa below `ops.FLASH_MIN_SEQ`, flash above, per call. Falls back to
-      `"sdpa"` (with a warning) if no kernel is present.
+    - `"auto"` — distribution-aware score dispatch. Untested cards inherit their
+      compute capability's measured policy; unknown capabilities use the generic score.
+      Falls back to `"sdpa"` (with a warning) only if no flash kernel is present.
 
     `validate` runs the hard gate during pack.
     """

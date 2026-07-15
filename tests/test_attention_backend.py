@@ -1,7 +1,7 @@
 """Attention-backend dispatch + resolution.
 
-Pure-logic tests (no GPU / model / flash kernel needed): the `attention()` switch
-routes correctly, `"auto"` resolves by sequence length around `FLASH_MIN_SEQ`, and
+Pure-logic tests (no GPU / model / flash kernel needed): the leaf `attention()` switch
+routes correctly, its unresolved capture-safe `auto` stays on SDPA, and
 `pack()`'s backend resolver raises for explicit `"flash"` without a kernel but
 downgrades `"auto"` to `"sdpa"`. The kernel call ABIs themselves are exercised on
 GPU elsewhere (cute on B200/H200, compiled on sm_120)."""
@@ -26,17 +26,17 @@ def _qkv(s: int):
     return t, t, t
 
 
-def test_auto_routes_by_seq_len(monkeypatch):
+def test_unresolved_leaf_auto_is_sdpa_at_every_seq_len(monkeypatch):
     calls = []
     monkeypatch.setattr(ops, "flash_attention", lambda q, k, v, window, scaling: calls.append("flash"))
     monkeypatch.setattr(ops, "sdpa_attention", lambda q, k, v, mask, scaling: calls.append("sdpa"))
 
-    q, k, v = _qkv(ops.FLASH_MIN_SEQ - 1)
+    q, k, v = _qkv(16)
     ops.attention(q, k, v, mask=None, window=(64, 64), scaling=0.125, backend="auto")
-    q, k, v = _qkv(ops.FLASH_MIN_SEQ)
+    q, k, v = _qkv(4096)
     ops.attention(q, k, v, mask=None, window=(64, 64), scaling=0.125, backend="auto")
 
-    assert calls == ["sdpa", "flash"]  # below threshold -> sdpa, at/above -> flash
+    assert calls == ["sdpa", "sdpa"]
 
 
 def test_explicit_backends_route_directly(monkeypatch):
@@ -73,21 +73,6 @@ def test_resolve_flash_absent(monkeypatch):
 def test_pack_rejects_unknown_backend():
     with pytest.raises(PackedEncodersError):
         pack(object(), attention_backend="bogus")
-
-
-def test_flash_min_seq_is_arch_keyed(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    # end-to-end crossovers (see ops._FLASH_MIN_SEQ_BY_CC); (7, 0) = unknown -> default
-    cases = {(12, 0): 256, (10, 0): 1024, (9, 0): 2048,
-             (8, 9): 512, (8, 0): 1024, (7, 0): 1024}
-    for cc, expected in cases.items():
-        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda cc=cc: cc)
-        assert ops._resolve_flash_min_seq() == expected
-
-
-def test_flash_min_seq_falls_back_without_cuda(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    assert ops._resolve_flash_min_seq() == ops._FLASH_MIN_SEQ_DEFAULT == 1024
 
 
 def test_default_backend_prefers_flash_when_available(monkeypatch):

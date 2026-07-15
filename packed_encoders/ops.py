@@ -339,36 +339,6 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
     return out.reshape(b, s, -1)
 
 
-# Per-arch sequence-length threshold for the "auto" backend: at/above it flash beats
-# sdpa, below it flash's fixed-cost floor loses. The crossover is arch-dependent, so
-# this keys on compute capability. Values are the measured *end-to-end* crossovers
-# (full encoder forward, not attention in isolation — which runs higher than the
-# attention-only micro-benchmark and is a conservative floor at small batch, where
-# fast GPUs are launch-bound).
-_FLASH_MIN_SEQ_BY_CC = {
-    (12, 0): 256,    # sm_120 — consumer Blackwell (5090), compiled FA2
-    (10, 0): 1024,   # sm_100 — datacenter Blackwell (B200), cute FA4
-    (9, 0): 2048,    # sm_90  — Hopper (H200), cute FA4: strong cuDNN sdpa + high FA4 floor
-    (8, 9): 512,     # sm_89  — Ada (L40S/L4), compiled FA2 (measured end-to-end crossover)
-    (8, 0): 1024,    # sm_80  — Ampere (A100), compiled FA2 (measured end-to-end crossover)
-}
-_FLASH_MIN_SEQ_DEFAULT = 1024
-
-
-def _resolve_flash_min_seq() -> int:
-    """The per-GPU `"auto"` flash threshold; falls back to the default without CUDA."""
-    try:
-        if not torch.cuda.is_available():
-            return _FLASH_MIN_SEQ_DEFAULT
-        cc = torch.cuda.get_device_capability()
-    except Exception:  # pragma: no cover - defensive: no/duff CUDA
-        return _FLASH_MIN_SEQ_DEFAULT
-    return _FLASH_MIN_SEQ_BY_CC.get(cc, _FLASH_MIN_SEQ_DEFAULT)
-
-
-FLASH_MIN_SEQ = _resolve_flash_min_seq()
-
-
 _flash_attn = None  # cached (func, varlen_func, kind), kind in {"cute", "compiled"}
 
 
@@ -481,7 +451,7 @@ def flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling):
     return out.reshape(1, total, -1)
 
 
-def use_bshd_rope_flash(backend, seq_len, h, d, cu_seqlens) -> bool:
+def use_bshd_rope_flash(backend, h, d, cu_seqlens) -> bool:
     """Whether to take the fused BSHD rope+flash path: the flash backend, a supported
     `(H, D)` (warp-packable), and **no autograd**. The no-grad gate is a *measured*
     dispatch decision, not laziness: BSHD is a clean inference win (bit-identical,
@@ -490,15 +460,14 @@ def use_bshd_rope_flash(backend, seq_len, h, d, cu_seqlens) -> bool:
     the attention backward's grad on the v slice, which costs more than the transpose
     path's single cat (5090: 0.81–1.01× fwd+bwd). So
     training keeps the transpose+rope path (where sequence packing already dominates), and
-    BSHD is wired where it actually pays. `"auto"` resolves to flash by the same S /
-    cu_seqlens rule as `attention`; `_bshd_applicable` is a pure capability check
-    (unsupported shapes fall back to transpose+rope), not a toggle."""
+    BSHD is wired where it actually pays. Eager `"auto"` is resolved to an explicit
+    backend before this point; an unresolved capture-safe `"auto"` stays off this path.
+    `_bshd_applicable` is a pure capability check (unsupported shapes fall back to
+    transpose+rope), not a toggle."""
     if torch.is_grad_enabled() or not _bshd_applicable(h, d):
         return False
     if backend == "flash":
         return True
-    if backend == "auto":
-        return cu_seqlens is not None or seq_len >= FLASH_MIN_SEQ
     return False
 
 
@@ -535,13 +504,14 @@ def flash_attention_qkv_bshd(
 
 def attention(q, k, v, *, mask, window, scaling, backend, cu_seqlens=None, max_seqlen=None):
     """Dispatch attention to the selected backend (`mask` feeds sdpa, `window` feeds
-    flash). `cu_seqlens` routes flash to the varlen path. `"auto"` resolves per call
-    from `q`'s sequence length (flash at `S >= FLASH_MIN_SEQ`, else sdpa) — resolving
-    at the leaf lets a captured graph bake in the right path per `(B, S)` bucket.
+    flash). `cu_seqlens` routes flash to the varlen path. Eager `"auto"` resolves
+    earlier from the distribution-aware score. An unresolved leaf-level `"auto"`
+    means a CUDA-graph/capture path without host-visible sequence statistics and stays
+    on SDPA; it never dispatches from sequence length.
     `pack()` downgrades `"auto"` to `"sdpa"` up front if no kernel is loadable, so
     this never imports mid-capture."""
     if backend == "auto":
-        backend = "flash" if q.shape[2] >= FLASH_MIN_SEQ else "sdpa"
+        backend = "sdpa"
     if backend == "flash":
         if cu_seqlens is not None:
             return flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling)

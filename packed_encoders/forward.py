@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from packed_encoders import ops
+from packed_encoders import attention_dispatch, ops
 from packed_encoders.config import ModernBertParams
 from packed_encoders.state import ATTR
 
@@ -190,7 +190,7 @@ def _encoder_layer(
             )
         qkv = ops._linear(normed, layer.attn.Wqkv.weight)
 
-    if ops.use_bshd_rope_flash(backend, s, h, d, cu_seqlens):
+    if ops.use_bshd_rope_flash(backend, h, d, cu_seqlens):
         # Inference flash fast path: RoPE reads the packed qkv and hands flash its native
         # [.., S, H, D] layout — no transpose to [B,H,S,D], no .contiguous() copy.
         ctx = ops.flash_attention_qkv_bshd(
@@ -287,12 +287,52 @@ def _has_padding(attention_mask: Tensor | None) -> bool:
     return attention_mask is not None and not bool((attention_mask == 1).all())
 
 
-def _resolve_eager_backend(backend: str, seq_len: int) -> str:
+def _resolve_eager_backend(
+    backend: str,
+    workload: attention_dispatch.AttentionWorkload | None = None,
+) -> str:
     """Resolve `"auto"` once at the forward level (so the varlen-vs-dense decision is
-    made before the loop), using the same `FLASH_MIN_SEQ` rule as `ops.attention`."""
+    made before the loop). CUDA workloads use the best available monotonic score;
+    unresolved CPU/capture calls stay on SDPA. Sequence length is never a dispatcher."""
     if backend == "auto":
-        return "flash" if seq_len >= ops.FLASH_MIN_SEQ else "sdpa"
+        if workload is not None:
+            policy = attention_dispatch.get_inference_policy()
+            if policy is not None:
+                return "flash" if policy.use_flash(workload) else "sdpa"
+        return "sdpa"
     return backend
+
+
+def _attention_workload(
+    params: ModernBertParams,
+    input_ids: Tensor,
+    attention_mask: Tensor | None,
+) -> attention_dispatch.AttentionWorkload:
+    """Build score inputs once at the eager boundary.
+
+    A mask requires one device-to-host transfer of `B` lengths. The old padded-flash
+    route already synchronized once in `_has_padding`; the returned workload also lets
+    `fused_forward` avoid repeating that probe.
+    """
+    b, padded_s = input_ids.shape
+    if attention_mask is None:
+        lengths = (padded_s,) * b
+    else:
+        lengths = tuple(
+            int(length)
+            for length in attention_mask.sum(dim=1, dtype=torch.int64).tolist()
+        )
+    global_layers = sum(
+        params.is_global_layer(layer_idx)
+        for layer_idx in range(params.num_hidden_layers)
+    )
+    return attention_dispatch.AttentionWorkload.from_lengths(
+        lengths,
+        padded_seqlen=padded_s,
+        half_window=params.sliding_half_window,
+        global_layers=global_layers,
+        local_layers=params.num_hidden_layers - global_layers,
+    )
 
 
 def _unpad(
@@ -446,9 +486,18 @@ def fused_forward(
 
     A padded batch with the flash backend routes through the packed varlen path;
     otherwise the rectangular `[B, S]` path (dense flash on unpadded, or sdpa)."""
-    resolved = _resolve_eager_backend(backend, input_ids.shape[1])
-    if resolved == "flash" and _has_padding(attention_mask):
-        return _varlen_forward(model, params, input_ids, attention_mask)
+    workload = None
+    if backend == "auto" and attention_dispatch.get_inference_policy() is not None:
+        workload = _attention_workload(params, input_ids, attention_mask)
+    resolved = _resolve_eager_backend(backend, workload)
+    if resolved == "flash":
+        has_padding = (
+            workload.padding_tokens > 0
+            if workload is not None
+            else _has_padding(attention_mask)
+        )
+        if has_padding:
+            return _varlen_forward(model, params, input_ids, attention_mask)
     p = prologue(model, params, input_ids, attention_mask)
     return core(
         model,
