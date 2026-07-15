@@ -2,8 +2,7 @@
 
 Kept dependency-light: yaml config loading, the AgentIR passage-corpus loader
 (F2's real long-document corpus), a token-length profiler, and small plotting
-utilities. The heavy measurement cores are reused from `benchmarks/` rather than
-duplicated here.
+utilities.
 """
 
 from __future__ import annotations

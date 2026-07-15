@@ -22,8 +22,8 @@ from packed_encoders.locate import find_encoder
 from packed_encoders.state import ATTR
 
 # Compute capabilities the fused-tail FORWARD is numerically validated on (sm_90/100/120
-# bit-identical; sm_80/sm_89 within the 0.997 band, scripts/modal_arch_probe.py). This
-# gate certifies only the forward — training on sm_8x is not yet probed.
+# bit-identical; sm_80/sm_89 within the 0.997 band). This gate certifies only the
+# forward — training on sm_8x is not yet probed.
 VALIDATED_CAPABILITIES = frozenset({(8, 0), (8, 9), (9, 0), (10, 0), (12, 0)})
 
 MIN_CUTLASS_DSL = (4, 5, 2)

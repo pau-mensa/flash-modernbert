@@ -344,7 +344,7 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
 # this keys on compute capability. Values are the measured *end-to-end* crossovers
 # (full encoder forward, not attention in isolation — which runs higher than the
 # attention-only micro-benchmark and is a conservative floor at small batch, where
-# fast GPUs are launch-bound). See benchmarks/varlen_bench.py and results/varlen_*.json.
+# fast GPUs are launch-bound).
 _FLASH_MIN_SEQ_BY_CC = {
     (12, 0): 256,    # sm_120 — consumer Blackwell (5090), compiled FA2
     (10, 0): 1024,   # sm_100 — datacenter Blackwell (B200), cute FA4
@@ -488,7 +488,7 @@ def use_bshd_rope_flash(backend, seq_len, h, d, cu_seqlens) -> bool:
     1.05–1.08× fwd, growing with S), but in training (fwd+bwd) it is a wash-to-regression
     — a BSHD RoPE backward must scatter a full `[N,3HD]` grad and have autograd sum it with
     the attention backward's grad on the v slice, which costs more than the transpose
-    path's single cat (5090: 0.81–1.01× fwd+bwd, see `benchmarks/bshd_rope_bench.py`). So
+    path's single cat (5090: 0.81–1.01× fwd+bwd). So
     training keeps the transpose+rope path (where sequence packing already dominates), and
     BSHD is wired where it actually pays. `"auto"` resolves to flash by the same S /
     cu_seqlens rule as `attention`; `_bshd_applicable` is a pure capability check

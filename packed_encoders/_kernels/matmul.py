@@ -5,9 +5,6 @@ selects a suboptimal tile on sm_120 (RTX 5090) for ModernBERT's projections and
 a hand-picked Triton config is faster.  On all other measured architectures —
 sm_80 (A100), sm_89 (L40S), sm_100 (B200) — cuBLAS wins at every shape and M
 by 1.5-2.3x, so the Triton path is sm_120-only.
-
-Cross-arch data: ``benchmarks/results/matmul_{a100,l40s,b200}.json``, generated
-by ``modal run scripts/modal_matmul_bench.py``.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Packed token-budget collator — **showcase scaffolding** (P0 of the packed paradigm).
 
-NOT part of the shipped packed-encoders surface (see `docs/packed_paradigm_showcase.md`
-§8). It produces the already-packed input that `packed_encoders.forward.packed_forward`
+Not part of the shipped packed-encoders surface. It produces the already-packed input
+that `packed_encoders.forward.packed_forward`
 consumes — real tokens only, no padding, end-to-end. The shipped package keeps the `[B, S]`
 drop-in forward; this collator is how the *showcase* opts into the fully-packed paradigm.
 
