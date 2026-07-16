@@ -674,7 +674,7 @@ def fused_forward(
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids)
             return _varlen_forward(
-                model, params, input_ids, attention_mask, backend=resolved
+                model, params, input_ids, attention_mask, backend=backend
             )
     p = prologue(model, params, input_ids, attention_mask)
     return core(
