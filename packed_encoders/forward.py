@@ -195,7 +195,7 @@ def _encoder_layer(
         # [.., S, H, D] layout — no transpose to [B,H,S,D], no .contiguous() copy.
         ctx = ops.flash_attention_qkv_bshd(
             qkv, h, d, cos=cos, sin=sin, window=window, scaling=params.scaling,
-            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, backend=backend,
         )
     else:
         qkv = qkv.view(b, s, 3, h, d)
@@ -290,17 +290,74 @@ def _has_padding(attention_mask: Tensor | None) -> bool:
 def _resolve_eager_backend(
     backend: str,
     workload: attention_dispatch.AttentionWorkload | None = None,
+    *,
+    triton_supported: bool = False,
+    flash_available: bool | None = None,
+    for_cuda_graph: bool = False,
 ) -> str:
-    """Resolve `"auto"` once at the forward level (so the varlen-vs-dense decision is
-    made before the loop). CUDA workloads use the best available monotonic score;
-    unresolved CPU/capture calls stay on SDPA. Sequence length is never a dispatcher."""
+    """Resolve the public backend before choosing packed versus rectangular compute.
+
+    On a calibrated card auto compares packed Triton with Flash; elsewhere it
+    conservatively prefers Flash.
+    SDPA is reached only when neither optimized backend can serve the call.
+    """
+    if flash_available is None:
+        flash_available = _flash_available()
+    inference = not torch.is_grad_enabled()
+    if backend == "triton":
+        if inference and triton_supported:
+            return "triton"
+        return "flash" if flash_available else "sdpa"
     if backend == "auto":
-        if workload is not None:
-            policy = attention_dispatch.get_inference_policy()
-            if policy is not None:
-                return "flash" if policy.use_flash(workload) else "sdpa"
-        return "sdpa"
+        if inference and triton_supported:
+            policy = attention_dispatch.get_packed_inference_policy(
+                for_cuda_graph=for_cuda_graph
+            )
+            if policy is not None and workload is not None:
+                return "flash" if flash_available and policy.use_flash(workload) else "triton"
+            if not flash_available:
+                return "triton"
+        return "flash" if flash_available else "sdpa"
     return backend
+
+
+def _flash_available() -> bool:
+    try:
+        ops._load_flash_attn()
+        return True
+    except ImportError:
+        return False
+
+
+def _triton_available() -> bool:
+    try:
+        ops._load_packed_short_attention()
+        return True
+    except ImportError:
+        return False
+
+
+def _packed_short_invariants(
+    params: ModernBertParams,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_seqlen: int,
+    cu_seqlens: Tensor | None = None,
+) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and device.type == "cuda"
+        and dtype == torch.bfloat16
+        and params.num_attention_heads == 12
+        and params.head_dim == 64
+        and 0 < int(max_seqlen) <= 128
+        and params.sliding_half_window == 64
+        and (cu_seqlens is None or (
+            cu_seqlens.is_cuda and cu_seqlens.dtype == torch.int32
+        ))
+        and _triton_available()
+    )
 
 
 def _attention_workload(
@@ -310,9 +367,8 @@ def _attention_workload(
 ) -> attention_dispatch.AttentionWorkload:
     """Build score inputs once at the eager boundary.
 
-    A mask requires one device-to-host transfer of `B` lengths. The old padded-flash
-    route already synchronized once in `_has_padding`; the returned workload also lets
-    `fused_forward` avoid repeating that probe.
+    A mask requires one device-to-host transfer of `B` lengths. The result retains
+    only shape statistics available to the packed eager/graph dispatcher.
     """
     b, padded_s = input_ids.shape
     if attention_mask is None:
@@ -322,17 +378,7 @@ def _attention_workload(
             int(length)
             for length in attention_mask.sum(dim=1, dtype=torch.int64).tolist()
         )
-    global_layers = sum(
-        params.is_global_layer(layer_idx)
-        for layer_idx in range(params.num_hidden_layers)
-    )
-    return attention_dispatch.AttentionWorkload.from_lengths(
-        lengths,
-        padded_seqlen=padded_s,
-        half_window=params.sliding_half_window,
-        global_layers=global_layers,
-        local_layers=params.num_hidden_layers - global_layers,
-    )
+    return attention_dispatch.AttentionWorkload.from_lengths(lengths)
 
 
 def _unpad(
@@ -373,6 +419,9 @@ def packed_forward(
     cu_seqlens: Tensor,
     max_seqlen: int,
     position_ids: Tensor,
+    *,
+    backend: str | None = None,
+    _allow_graph: bool = True,
 ) -> Tensor:
     """Run the encoder on an *already-packed* batch; return packed `[total, H]`.
 
@@ -396,14 +445,19 @@ def packed_forward(
             `indices % S` for right-padded data) or RoPE positions — and any
             padded-vs-packed parity — break.
 
-    Additive and non-breaking: the shipped `[B, S]` HF forward is untouched; this is an
-    explicit opt-into-the-paradigm call. Flash backend only (packing *is* the flash
-    varlen kernel). Slightly cheaper than `_varlen_forward` too — no `index_select` /
-    `index_copy` padding round-trip.
+    Additive and non-breaking: the shipped `[B, S]` HF forward is untouched. The
+    backend defaults to the model's packed-encoders setting; without patch state it
+    retains the historical Flash default.
     """
     state = getattr(model, ATTR, None)
+    requested_backend = (
+        backend if backend is not None
+        else (state.attention_backend if state is not None else "flash")
+    )
     if (
-        state is not None
+        _allow_graph
+        and state is not None
+        and requested_backend == state.attention_backend
         and state.packed_graph_runner is not None
         and os.environ.get(_GRAPH_ENV, "1") != "0"
         and not torch.is_grad_enabled()
@@ -437,6 +491,14 @@ def packed_forward(
     def gather(t: Tensor) -> Tensor:
         return t[0].index_select(0, position_ids)
 
+    packed_backend = _resolve_packed_backend(
+        requested_backend, params, x_packed, cu_seqlens, max_seqlen
+    )
+    if packed_backend == "sdpa":
+        return _packed_sdpa_fallback(
+            model, params, packed_ids, cu_seqlens, max_seqlen, position_ids
+        )
+
     out = core(
         model,
         params,
@@ -447,11 +509,109 @@ def packed_forward(
         gather(sin_l),
         None,
         None,
-        backend="flash",
+        backend=packed_backend,
         cu_seqlens=cu_seqlens,
         max_seqlen=max_seqlen,
     )
     return out.squeeze(0)
+
+
+def _resolve_packed_backend(
+    backend: str,
+    params: ModernBertParams,
+    x: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+) -> str:
+    """Resolve packed Triton versus Flash once, before the layer loop.
+
+    The predicate is host-only and graph-capture-safe: the 5090 policy reads only
+    static tensor shapes, never ``cu_seqlens`` values. The selected backend is baked
+    into each packed graph bucket.
+    """
+    return _resolve_packed_backend_from_shape(
+        backend,
+        params,
+        device=x.device,
+        dtype=x.dtype,
+        total_tokens=x.shape[-2],
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+    )
+
+
+def _resolve_packed_backend_from_shape(
+    backend: str,
+    params: ModernBertParams,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    total_tokens: int,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    for_cuda_graph: bool = False,
+) -> str:
+    """Resolve from host-visible packed shapes before eager execution or capture."""
+    supported = _packed_short_invariants(
+        params,
+        device=device,
+        dtype=dtype,
+        max_seqlen=max_seqlen,
+        cu_seqlens=cu_seqlens,
+    )
+    flash_available = _flash_available()
+    workload = _packed_workload(
+        total_tokens=total_tokens,
+        n_sequences=cu_seqlens.numel() - 1,
+        max_seqlen=max_seqlen,
+    )
+    resolved = _resolve_eager_backend(
+        backend,
+        workload,
+        triton_supported=supported,
+        flash_available=flash_available,
+        for_cuda_graph=for_cuda_graph,
+    )
+    return resolved
+
+
+def _packed_sdpa_fallback(
+    model: nn.Module,
+    params: ModernBertParams,
+    packed_ids: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    position_ids: Tensor,
+) -> Tensor:
+    """Re-pad an already-packed batch for the dependency-free SDPA fallback."""
+    n_sequences = cu_seqlens.numel() - 1
+    total = packed_ids.numel()
+    token_index = torch.arange(total, device=packed_ids.device)
+    sequence_ids = torch.bucketize(token_index, cu_seqlens[1:], right=True)
+    flat_indices = sequence_ids * int(max_seqlen) + position_ids
+    padded_ids = packed_ids.new_zeros(n_sequences * int(max_seqlen))
+    padded_ids.index_copy_(0, flat_indices, packed_ids)
+    attention_mask = packed_ids.new_zeros(n_sequences * int(max_seqlen))
+    attention_mask.index_fill_(0, flat_indices, 1)
+    padded_out = fused_forward(
+        model,
+        params,
+        padded_ids.view(n_sequences, int(max_seqlen)),
+        attention_mask.view(n_sequences, int(max_seqlen)),
+        backend="sdpa",
+    )
+    return padded_out.reshape(-1, padded_out.shape[-1]).index_select(0, flat_indices)
+
+
+def _packed_workload(
+    *, total_tokens: int, n_sequences: int, max_seqlen: int
+) -> attention_dispatch.AttentionWorkload:
+    """Shape-only workload used by eager and captured packed policies."""
+    return attention_dispatch.AttentionWorkload.from_summary(
+        n_sequences=n_sequences,
+        live_tokens=total_tokens,
+        max_seqlen=max_seqlen,
+    )
 
 
 def _varlen_forward(
@@ -459,6 +619,8 @@ def _varlen_forward(
     params: ModernBertParams,
     input_ids: Tensor,
     attention_mask: Tensor,
+    *,
+    backend: str = "flash",
 ) -> Tensor:
     """Run the encoder on the packed (unpadded) batch as a single `b=1` sequence,
     then re-pad. Internally: `_unpad` → `packed_forward` → `_repad`, i.e. the packed
@@ -470,7 +632,10 @@ def _varlen_forward(
         input_ids.unsqueeze(-1), attention_mask
     )
     packed_ids = packed_ids.squeeze(-1)
-    out = packed_forward(model, params, packed_ids, cu_seqlens, max_seqlen, position_ids)
+    out = packed_forward(
+        model, params, packed_ids, cu_seqlens, max_seqlen, position_ids,
+        backend=backend,
+    )
     return _repad(out, indices, b, s)
 
 
@@ -487,17 +652,30 @@ def fused_forward(
     A padded batch with the flash backend routes through the packed varlen path;
     otherwise the rectangular `[B, S]` path (dense flash on unpadded, or sdpa)."""
     workload = None
-    if backend == "auto" and attention_dispatch.get_inference_policy() is not None:
+    if backend in ("auto", "triton"):
         workload = _attention_workload(params, input_ids, attention_mask)
-    resolved = _resolve_eager_backend(backend, workload)
-    if resolved == "flash":
+    weight = model.embeddings.tok_embeddings.weight
+    triton_supported = backend in ("auto", "triton") and _packed_short_invariants(
+        params,
+        device=input_ids.device,
+        dtype=weight.dtype,
+        max_seqlen=(workload.max_seqlen if workload is not None else input_ids.shape[1]),
+    )
+    resolved = _resolve_eager_backend(
+        backend, workload, triton_supported=triton_supported
+    )
+    if resolved in ("flash", "triton"):
         has_padding = (
-            workload.padding_tokens > 0
+            workload.fragmentation_tokens > 0
             if workload is not None
             else _has_padding(attention_mask)
         )
-        if has_padding:
-            return _varlen_forward(model, params, input_ids, attention_mask)
+        if resolved == "triton" or has_padding:
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            return _varlen_forward(
+                model, params, input_ids, attention_mask, backend=resolved
+            )
     p = prologue(model, params, input_ids, attention_mask)
     return core(
         model,

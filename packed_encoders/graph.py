@@ -51,11 +51,14 @@ class GraphConfig:
       its own graph; set, every `b <= max_batch` replays one padded `max_batch`-row
       graph (the first `b` rows sliced out) and `b > max_batch` falls back to eager —
       the strongest cache bound for variable-batch workloads (e.g. partial last batch).
+      For the distribution-aware packed runner it is only an admission bound; packed
+      graphs retain the real sequence count in their cache key.
     - `seq_buckets` (with `max_batch`) pre-captures those buckets at `pack()` time
       instead of lazily.
     - `max_graphs` bounds the cache by LRU eviction; a shape over `max_tokens` is
       never captured.
-    - `max_seq` (default None = no cutoff) runs `s > max_seq` eager. Graphs win at
+    - `max_seq` (default None = no cutoff) runs `s > max_seq` eager. Packed graphs
+      retain the real `Smax` in their key instead of padding it to this bound. Graphs win at
       short S but lose at long S on both latency (the static dense mask precludes
       SDPA's flash path) and memory — measured with `max_memory_reserved`, not
       `allocated`, which hides a graph's private pool. So the cutoff keeps graphs on
@@ -234,12 +237,15 @@ class _PackedCaptured:
 
 
 class _PackedGraphRunner:
-    """Graph runner for ``packed_forward``: one graph per M-bucket.
+    """Graph runner for ``packed_forward``: one graph per packed shape/backend.
 
     The packed tensor shape is ``[1, M, H]`` (batch dim is always 1; sequences
-    are encoded in ``cu_seqlens``).  The graph captures at a fixed ``M_bucket``
-    with ``max_batch`` sequences and ``max_seq`` RoPE range.  Padding tokens
-    beyond the real M are processed (wasted work) but their output is discarded.
+    are encoded in ``cu_seqlens``). A graph captures fixed ``(M_bucket, N, Smax)``
+    shapes; ``max_batch`` and ``max_seq`` are bounds, not padded capacities. The
+    resolved backend is part of the key so equal-M distributions may take opposite
+    sides of a distribution-aware policy. Padding tokens beyond real M are processed
+    by the non-attention tail (wasted work), but attention ignores them and their
+    output is discarded.
     """
 
     def __init__(
@@ -247,12 +253,16 @@ class _PackedGraphRunner:
         model: nn.Module,
         params: ModernBertParams,
         config: GraphConfig,
+        backend: str = "auto",
     ):
         self._model = model
         self._params = params
         self._config = config
+        self._backend = backend
         self._device = next(model.parameters()).device
-        self._cache: OrderedDict[int, _PackedCaptured] = OrderedDict()
+        self._cache: OrderedDict[tuple[int, int, int, str], _PackedCaptured] = (
+            OrderedDict()
+        )
 
     def __call__(
         self,
@@ -262,21 +272,39 @@ class _PackedGraphRunner:
         position_ids: Tensor,
     ) -> Tensor:
         m = packed_ids.shape[0]
+        n = cu_seqlens.numel() - 1
         max_seq = self._config.max_seq
         if max_seq is not None and max_seqlen > max_seq:
+            return self._eager(packed_ids, cu_seqlens, max_seqlen, position_ids)
+        max_batch = self._config.max_batch
+        if max_batch is not None and n > max_batch:
             return self._eager(packed_ids, cu_seqlens, max_seqlen, position_ids)
         if m > self._config.max_tokens:
             return self._eager(packed_ids, cu_seqlens, max_seqlen, position_ids)
 
         mb = _round_up(m, self._config.pad_to)
-        captured = self._cache.get(mb)
+        dtype = self._model.embeddings.tok_embeddings.weight.dtype
+        resolved_backend = forward._resolve_packed_backend_from_shape(
+            self._backend,
+            self._params,
+            device=packed_ids.device,
+            dtype=dtype,
+            total_tokens=m,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            for_cuda_graph=True,
+        )
+        key = (mb, n, int(max_seqlen), resolved_backend)
+        captured = self._cache.get(key)
         if captured is not None:
-            self._cache.move_to_end(mb)
+            self._cache.move_to_end(key)
         else:
-            captured = self._capture(mb)
+            captured = self._capture(
+                mb, n, int(max_seqlen), resolved_backend
+            )
             while len(self._cache) >= self._config.max_graphs:
                 self._cache.popitem(last=False)
-            self._cache[mb] = captured
+            self._cache[key] = captured
 
         m_real = captured.inputs.stage(packed_ids, cu_seqlens, position_ids)
         captured.graph.replay()
@@ -290,48 +318,52 @@ class _PackedGraphRunner:
             cu_seqlens,
             max_seqlen,
             position_ids,
+            backend=self._backend,
+            _allow_graph=False,
         )
 
-    def _capture(self, mb: int) -> _PackedCaptured:
-        max_seq = self._config.max_seq
-        bb = self._config.max_batch
-        if max_seq is None or bb is None:
-            raise ValueError(
-                "packed graph runner requires both max_seq and max_batch"
-            )
+    def _capture(
+        self, mb: int, n: int, max_seqlen: int, resolved_backend: str
+    ) -> _PackedCaptured:
         static = _PackedStaticInputs(
             input_ids=torch.zeros(mb, dtype=torch.long, device=self._device),
             cu_seqlens=torch.zeros(
-                bb + 1, dtype=torch.int32, device=self._device
+                n + 1, dtype=torch.int32, device=self._device
             ),
             position_ids=torch.zeros(
                 mb, dtype=torch.long, device=self._device
             ),
-            max_seqlen=max_seq,
+            max_seqlen=max_seqlen,
         )
-        per_seq = max(1, mb // bb)
-        for i in range(bb):
-            end = min((i + 1) * per_seq, mb)
-            static.cu_seqlens[i + 1] = end
+        # Compile/capture with a valid synthetic distribution. M-bucket rounding can
+        # exceed N*Smax; those tail tokens deliberately remain outside cu_seqlens.
+        remaining = min(mb, n * max_seqlen)
+        for i in range(n):
             start = int(static.cu_seqlens[i])
+            length = min(max_seqlen, remaining)
+            end = start + length
+            static.cu_seqlens[i + 1] = end
             static.position_ids[start:end] = torch.arange(
                 end - start, device=self._device
             )
+            remaining -= length
 
         with torch.no_grad():
             warm = torch.cuda.Stream()
             warm.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(warm):
                 for _ in range(self._config.warmup):
-                    self._run_forward(static)
+                    self._run_forward(static, resolved_backend)
             torch.cuda.current_stream().wait_stream(warm)
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                out = self._run_forward(static)
+                out = self._run_forward(static, resolved_backend)
         return _PackedCaptured(graph=graph, inputs=static, out=out)
 
-    def _run_forward(self, static: _PackedStaticInputs) -> Tensor:
+    def _run_forward(
+        self, static: _PackedStaticInputs, resolved_backend: str
+    ) -> Tensor:
         model, params = self._model, self._params
         emb = model.embeddings.tok_embeddings(static.input_ids)
         x = ops.fused_layer_norm(emb, model.embeddings.norm.weight,
@@ -357,7 +389,7 @@ class _PackedGraphRunner:
             gather(cos_g), gather(sin_g),
             gather(cos_l), gather(sin_l),
             None, None,
-            backend="flash",
+            backend=resolved_backend,
             cu_seqlens=static.cu_seqlens,
             max_seqlen=static.max_seqlen,
         )
@@ -365,11 +397,14 @@ class _PackedGraphRunner:
 
 
 def build_packed_runner(
-    model: nn.Module, params: ModernBertParams, config: GraphConfig
+    model: nn.Module,
+    params: ModernBertParams,
+    config: GraphConfig,
+    backend: str = "auto",
 ) -> _PackedGraphRunner | None:
-    if config.max_batch is None or config.max_seq is None:
+    if backend == "sdpa" or config.max_batch is None or config.max_seq is None:
         return None
-    return _PackedGraphRunner(model, params, config)
+    return _PackedGraphRunner(model, params, config, backend=backend)
 
 
 def build_runner(
@@ -402,9 +437,17 @@ def set_cuda_graph(model: object, enabled: bool, *, config: GraphConfig | None =
     first time it is enabled requires CUDA and is lazy per shape."""
     state = get_state(model)
     if enabled and state.graph_runner is None:
-        state.graph_runner = build_runner(
-            find_encoder(model), state.params, config or GraphConfig(),
-            backend=state.attention_backend,
+        encoder = find_encoder(model)
+        graph_config = config or GraphConfig()
+        backend = state.attention_backend
+        if backend in ("auto", "triton"):
+            backend = None
+        if backend is not None:
+            state.graph_runner = build_runner(
+                encoder, state.params, graph_config, backend=backend,
+            )
+        state.packed_graph_runner = build_packed_runner(
+            encoder, state.params, graph_config, backend=state.attention_backend,
         )
     state.graph_enabled = enabled
 

@@ -46,6 +46,10 @@ def pack(
     backward graph writes into persistent `.grad`) and exact `(B, S)` shapes (the bf16
     backward is padding-sensitive).
 
+    Inference `auto`/`triton` graph capture applies to `packed_forward()` only; a
+    rectangular graph cannot derive dynamic packed boundaries capture-safely. It needs
+    an explicit `GraphConfig` with both `max_batch` and `max_seq`.
+
     `cuda_graph_seq_cutoff` (default 64) bounds which calls get graphed via the bool
     shortcut: only `s <= cutoff` is captured. Graphs win only at short S, so this keeps
     them on queries and off documents (PyLate encodes each group in its own call, so
@@ -54,23 +58,27 @@ def pack(
 
     `attention_backend` selects the attention kernel:
 
-    - **`None` (default)** — `"auto"` when a flash kernel is importable, else `"sdpa"`.
+    - **`None` (default)** — `"auto"` when Flash or packed Triton is importable,
+      else `"sdpa"`.
       Resolves silently (an unset backend makes no demand).
     - `"sdpa"` — dependency-free, dense-mask; the safe universal choice.
     - `"flash"` — FlashAttention with sliding-window pruning; on a padded batch it
       uses the varlen kernel. Needs a kernel (FA4-cute on sm_90/sm_100, compiled
       flash-attn on sm_120); raises if none is present.
-    - `"auto"` — distribution-aware score dispatch. Untested cards inherit their
-      compute capability's measured policy; unknown capabilities use the generic score.
-      Falls back to `"sdpa"` (with a warning) only if no flash kernel is present.
+    - `"triton"` — the packed short-attention kernel for no-grad bf16 CUDA
+      ModernBERT-base workloads with `Smax<=128`; invariant misses prefer Flash and
+      then SDPA.
+    - `"auto"` — exact-card calibrated packed Triton/Flash dispatch for RTX 5090,
+      A100, L40S, H200, and B200. Uncalibrated cards prefer Flash. SDPA is only the
+      final no-kernel fallback.
 
     `validate` runs the hard gate during pack.
     """
     if attention_backend is None:
         attention_backend = _default_backend()
-    if attention_backend not in ("sdpa", "flash", "auto"):
+    if attention_backend not in ("sdpa", "flash", "triton", "auto"):
         raise PackedEncodersError(
-            "attention_backend must be 'sdpa', 'flash', 'auto', or None, got "
+            "attention_backend must be 'sdpa', 'flash', 'triton', 'auto', or None, got "
             f"{attention_backend!r}"
         )
     encoder = find_encoder(target)
@@ -106,29 +114,44 @@ def pack(
 
 
 def _default_backend() -> str:
-    """Resolve an unset `attention_backend`: `"auto"` if a flash kernel imports, else
-    `"sdpa"`. Silent — an unset backend is not a request, so no warning."""
+    """Use auto if either optimized attention implementation imports."""
     try:
         ops._load_flash_attn()
         return "auto"
     except ImportError:
-        return "sdpa"
+        try:
+            ops._load_packed_short_attention()
+            return "auto"
+        except ImportError:
+            return "sdpa"
 
 
 def _resolve_attention_backend(backend: str) -> str:
-    """Confirm a flash kernel imports up front for `"flash"`/`"auto"`, so a captured
-    graph never hits a mid-capture `ImportError`. `"flash"` raises if none is available;
-    `"auto"` downgrades to `"sdpa"` with a warning; `"sdpa"` is a no-op."""
+    """Validate explicit dependencies and collapse auto only when neither exists."""
     if backend == "sdpa":
         return backend
+    flash_error = None
+    triton_error = None
     try:
         ops._load_flash_attn()
     except ImportError as exc:
-        if backend == "flash":
-            raise PackedEncodersError(str(exc)) from exc
+        flash_error = exc
+    try:
+        ops._load_packed_short_attention()
+    except ImportError as exc:
+        triton_error = exc
+
+    if backend == "flash" and flash_error is not None:
+        raise PackedEncodersError(str(flash_error)) from flash_error
+    if backend == "triton" and triton_error is not None:
+        raise PackedEncodersError(
+            f"attention_backend='triton' is unavailable: {triton_error}"
+        ) from triton_error
+    if backend == "auto" and flash_error is not None and triton_error is not None:
         warnings.warn(
-            f"attention_backend='auto' but no FlashAttention kernel is available "
-            f"({exc}); falling back to 'sdpa'.",
+            "attention_backend='auto' but neither FlashAttention nor the packed "
+            f"Triton kernel is available ({flash_error}; {triton_error}); falling "
+            "back to 'sdpa'.",
             stacklevel=2,
         )
         return "sdpa"
@@ -147,10 +170,19 @@ def _enable_graphs(
         cuda_graph if isinstance(cuda_graph, GraphConfig)
         else GraphConfig(max_seq=seq_cutoff)
     )
-    state.graph_runner = build_runner(
+    graph_backend = state.attention_backend
+    if graph_backend in ("auto", "triton"):
+        # A rectangular graph cannot turn a dynamic padding mask into capture-safe
+        # cu_seqlens. Auto/Triton graph only through the already-packed runner; using
+        # dense Flash here would attend to padding, while SDPA would violate auto.
+        graph_backend = None
+    state.graph_runner = (
+        build_runner(encoder, state.params, config, backend=graph_backend)
+        if graph_backend is not None else None
+    )
+    state.packed_graph_runner = build_packed_runner(
         encoder, state.params, config, backend=state.attention_backend
     )
-    state.packed_graph_runner = build_packed_runner(encoder, state.params, config)
     state.graph_enabled = True
 
 
@@ -166,8 +198,13 @@ def _enable_train_graphs(
         train_cuda_graph if isinstance(train_cuda_graph, TrainGraphConfig)
         else TrainGraphConfig(max_seq=seq_cutoff)
     )
+    train_backend = state.attention_backend
+    if train_backend in ("auto", "triton"):
+        # The packed Triton kernel is inference-only. Keep the existing dense SDPA
+        # training graph until a separate forward+backward crossover is calibrated.
+        train_backend = "sdpa"
     state.train_graph_runner = build_train_runner(
-        encoder, state.params, config, backend=state.attention_backend
+        encoder, state.params, config, backend=train_backend
     )
     state.train_graph_enabled = True
 

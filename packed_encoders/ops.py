@@ -342,6 +342,16 @@ def sdpa_attention(q, k, v, additive_mask, scaling):
 _flash_attn = None  # cached (func, varlen_func, kind), kind in {"cute", "compiled"}
 
 
+def _load_packed_short_attention():
+    """Lazily import the optional Triton packed-attention implementation."""
+    from packed_encoders._kernels.triton_packed_attention import (
+        packed_short_attention,
+        packed_short_attention_supported,
+    )
+
+    return packed_short_attention, packed_short_attention_supported
+
+
 def _import_cute_flash():
     from flash_attn.cute import (  # CuteDSL FA4 (sm_90/100/110)
         flash_attn_func,
@@ -361,8 +371,8 @@ def _import_compiled_flash():
 
 
 def _load_flash_attn():
-    """Resolve and cache the flash kernel for this GPU, lazily (so the default sdpa
-    path stays dependency-free). Arch-dependent: cute FA4 on sm_90/sm_100 (no sm_120
+    """Resolve and cache the flash kernel for this GPU lazily, so the explicit SDPA
+    fallback stays dependency-free. Arch-dependent: cute FA4 on sm_90/sm_100 (no sm_120
     kernel — no tcgen05), compiled flash-attn FA2 on sm_120. Tries the arch-appropriate
     one first, then the other; raises only if neither imports. `kind` selects the call
     ABI (cute and compiled funcs differ)."""
@@ -386,7 +396,7 @@ def _load_flash_attn():
     raise ImportError(
         "attention_backend='flash'/'auto' needs a FlashAttention kernel: "
         "flash-attn-4 on sm_90/sm_100 (pip install flash-attn-4) or flash-attn on "
-        "sm_120 (pip install flash-attn). The default 'sdpa' backend needs neither. "
+        "sm_120 (pip install flash-attn). The explicit 'sdpa' backend needs neither. "
         "Tried: " + "; ".join(errors)
     )
 
@@ -452,8 +462,9 @@ def flash_attention_varlen(q, k, v, cu_seqlens, max_seqlen, window, scaling):
 
 
 def use_bshd_rope_flash(backend, h, d, cu_seqlens) -> bool:
-    """Whether to take the fused BSHD rope+flash path: the flash backend, a supported
-    `(H, D)` (warp-packable), and **no autograd**. The no-grad gate is a *measured*
+    """Whether to take the packed BSHD RoPE+attention path: FA or Triton short
+    prototype, a supported `(H, D)` (warp-packable), and **no autograd**. The no-grad
+    gate is a *measured*
     dispatch decision, not laziness: BSHD is a clean inference win (bit-identical,
     1.05–1.08× fwd, growing with S), but in training (fwd+bwd) it is a wash-to-regression
     — a BSHD RoPE backward must scatter a full `[N,3HD]` grad and have autograd sum it with
@@ -466,22 +477,41 @@ def use_bshd_rope_flash(backend, h, d, cu_seqlens) -> bool:
     transpose+rope), not a toggle."""
     if torch.is_grad_enabled() or not _bshd_applicable(h, d):
         return False
-    if backend == "flash":
+    if backend in ("flash", "triton"):
         return True
     return False
 
 
 def flash_attention_qkv_bshd(
-    qkv, h, d, *, cos, sin, window, scaling, cu_seqlens=None, max_seqlen=None
+    qkv, h, d, *, cos, sin, window, scaling, cu_seqlens=None, max_seqlen=None,
+    backend="flash",
 ):
-    """Fused BSHD RoPE + FlashAttention reading the packed `qkv` `[.., S, 3*H*D]`
-    directly. RoPE'd q/k come out contiguous `[.., S, H, D]` and v is the qkv slice (D
+    """BSHD RoPE + packed attention reading `qkv` `[.., S, 3*H*D]` directly.
+
+    RoPE'd q/k come out contiguous `[.., S, H, D]` and v is the qkv slice (D
     contiguous) — all in flash's native layout, so there is **no transpose to [B,H,S,D]
     and no `.contiguous()` copy** (the transpose path pays both: q/k strided→contiguous,
     then flash transposes back). `cu_seqlens` selects the packed varlen kernel. Returns
     `[.., S, hidden]`. No-grad only (see `use_bshd_rope_flash` — training is a wash)."""
     q, k = _rope_bshd_kernel(qkv, h, d, cos, sin)            # contiguous [.., S, H, D]
     v = qkv.view(*qkv.shape[:-1], 3, h, d)[..., 2, :, :]     # [.., S, H, D] (D contiguous)
+    if backend == "triton" and cu_seqlens is not None:
+        qf, kf, vf = q.squeeze(0), k.squeeze(0), v.squeeze(0)
+        packed_short_attention, packed_short_attention_supported = (
+            _load_packed_short_attention()
+        )
+
+        half_window = None if window == (-1, -1) else window[0]
+        if packed_short_attention_supported(
+            qf, kf, vf, cu_seqlens, max_seqlen, half_window=half_window
+        ):
+            out = packed_short_attention(
+                qf, kf, vf, cu_seqlens, max_seqlen,
+                half_window=half_window, softmax_scale=scaling,
+            )
+            return out.reshape(1, out.shape[0], -1)
+        # Runtime resolution normally guarantees support. Keep FA as the defensive
+        # invariant-miss fallback for direct low-level callers.
     func, varlen, kind = _load_flash_attn()
     cute = kind == "cute"
     w = ((None, None) if window == (-1, -1) else window) if cute else window

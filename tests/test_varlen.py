@@ -42,8 +42,13 @@ from packed_encoders import forward, ops
 def test_resolve_eager_backend():
     assert forward._resolve_eager_backend("sdpa") == "sdpa"
     assert forward._resolve_eager_backend("flash") == "flash"
-    # An unresolved auto is capture/CPU-safe SDPA, never an S-length decision.
-    assert forward._resolve_eager_backend("auto") == "sdpa"
+    # Auto never selects SDPA while Flash is available.
+    assert forward._resolve_eager_backend(
+        "auto", flash_available=True
+    ) == "flash"
+    assert forward._resolve_eager_backend(
+        "auto", flash_available=False
+    ) == "sdpa"
 
 
 def test_has_padding():
@@ -92,6 +97,28 @@ def test_unpad_no_padding_is_identity_order():
     assert x_packed.shape == (6, 5)
     assert cu_seqlens.tolist() == [0, 3, 6]
     assert position_ids.tolist() == [0, 1, 2, 0, 1, 2]
+
+
+def test_packed_sdpa_fallback_repads_and_restores_packed_order(monkeypatch):
+    packed_ids = torch.tensor([11, 12, 21, 31, 32, 33])
+    cu = torch.tensor([0, 2, 3, 6], dtype=torch.int32)
+    positions = torch.tensor([0, 1, 0, 0, 1, 2])
+    seen = {}
+
+    def fake_fused(_model, _params, ids, mask, *, backend):
+        seen["ids"] = ids.clone()
+        seen["mask"] = mask.clone()
+        seen["backend"] = backend
+        return ids.unsqueeze(-1).expand(*ids.shape, 2)
+
+    monkeypatch.setattr(forward, "fused_forward", fake_fused)
+    out = forward._packed_sdpa_fallback(
+        object(), object(), packed_ids, cu, 3, positions
+    )
+    assert seen["backend"] == "sdpa"
+    assert seen["ids"].tolist() == [[11, 12, 0], [21, 0, 0], [31, 32, 33]]
+    assert seen["mask"].tolist() == [[1, 1, 0], [1, 0, 0], [1, 1, 1]]
+    assert out[:, 0].tolist() == packed_ids.tolist()
 
 
 # --------------------------------------------------------------------------- #
@@ -176,10 +203,10 @@ def test_5090_auto_routes_by_distribution_score(models, monkeypatch):
 
     monkeypatch.setattr(forward, "core", recording_core)
     cases = [
-        ((1024,), "sdpa"),                 # long but too little aggregate work
-        ((1024, 1024), "flash"),           # same S, enough aggregate work
-        ((64,) * 64, "sdpa"),              # deliberately omitted ~1-2% boundary win
-        ((64, 32) * 32, "flash"),          # same padded shape, padding credits varlen
+        ((128,) * 8, "triton"),            # AgentIR head, well below crossover
+        ((128,) * 160, "triton"),          # M=20,480: 2.9% FA edge is below guard
+        ((96,) * 216, "flash"),            # M=20,736: first guarded FA win
+        ((64, 32) * 32, "triton"),         # decision follows live packed work
     ]
     for lengths, expected in cases:
         b, s = len(lengths), max(lengths)
@@ -337,6 +364,10 @@ def test_packed_forward_entry_matches_hf(models, texts):
         packed_out = forward.packed_forward(
             encoder, params, packed_ids, cu_seqlens, max_seqlen, position_ids
         )
+        packed_sdpa_out = forward.packed_forward(
+            encoder, params, packed_ids, cu_seqlens, max_seqlen, position_ids,
+            backend="sdpa",
+        )
         ref = stock(input_ids=ids, attention_mask=am).last_hidden_state
     assert packed_out.shape == (int(am.sum()), ref.shape[-1])  # [total, H], no repad
     ref_packed = ref.reshape(b * s, -1).index_select(0, indices)
@@ -344,6 +375,10 @@ def test_packed_forward_entry_matches_hf(models, texts):
         packed_out.flatten().float(), ref_packed.flatten().float(), dim=0
     ).item()
     assert cos > 0.997, f"packed entry vs HF real-token cos {cos:.5f}"
+    sdpa_cos = F.cosine_similarity(
+        packed_sdpa_out.flatten().float(), ref_packed.flatten().float(), dim=0
+    ).item()
+    assert sdpa_cos > 0.997, f"packed SDPA fallback vs HF cos {sdpa_cos:.5f}"
 
 
 @needs_flash

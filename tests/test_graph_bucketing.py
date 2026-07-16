@@ -232,3 +232,63 @@ def test_seq_buckets_without_max_batch_warns(encoder, params):
     with pytest.warns(UserWarning, match="seq_buckets needs max_batch"):
         runner = build_runner(encoder, params, GraphConfig(seq_buckets=(64,)))
     assert len(runner._cache) == 0  # nothing pre-captured without a batch dim
+
+
+def test_packed_graph_key_retains_actual_distribution_and_backend(monkeypatch):
+    """Equal M buckets must not alias different N/S policy decisions."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from packed_encoders import forward
+    from packed_encoders.graph import (
+        GraphConfig,
+        _PackedCaptured,
+        _PackedGraphRunner,
+    )
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.embeddings = SimpleNamespace(
+                tok_embeddings=SimpleNamespace(weight=self.anchor)
+            )
+
+    runner = _PackedGraphRunner(
+        DummyModel(), object(),
+        GraphConfig(pad_to=8, max_batch=4, max_seq=128),
+        backend="auto",
+    )
+    captures = []
+
+    class FakeInputs:
+        def stage(self, packed_ids, cu_seqlens, position_ids):
+            return packed_ids.numel()
+
+    class FakeGraph:
+        def replay(self):
+            pass
+
+    def fake_resolve(_backend, _params, **kwargs):
+        return "triton" if kwargs["cu_seqlens"].numel() == 3 else "flash"
+
+    def fake_capture(mb, n, s, backend):
+        captures.append((mb, n, s, backend))
+        return _PackedCaptured(
+            graph=FakeGraph(), inputs=FakeInputs(), out=torch.zeros((mb, 4))
+        )
+
+    monkeypatch.setattr(forward, "_resolve_packed_backend_from_shape", fake_resolve)
+    monkeypatch.setattr(runner, "_capture", fake_capture)
+    ids = torch.arange(6)
+    positions = torch.arange(6)
+    runner(ids, torch.tensor((0, 3, 6), dtype=torch.int32), 64, positions)
+    runner(ids, torch.tensor((0, 2, 4, 6), dtype=torch.int32), 32, positions)
+    runner(ids, torch.tensor((0, 3, 6), dtype=torch.int32), 64, positions)
+
+    assert captures == [(8, 2, 64, "triton"), (8, 3, 32, "flash")]
+    assert list(runner._cache) == [
+        (8, 3, 32, "flash"),
+        (8, 2, 64, "triton"),
+    ]

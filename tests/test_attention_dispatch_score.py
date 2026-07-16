@@ -1,4 +1,4 @@
-"""Pure-logic coverage for the distribution-aware attention score."""
+"""Pure-logic coverage for packed Triton/Flash monotonic scores."""
 
 from __future__ import annotations
 
@@ -8,107 +8,116 @@ from packed_encoders import attention_dispatch, forward
 from packed_encoders.config import ModernBertParams
 
 
-def _workload(lengths, padded_seqlen=None):
-    return attention_dispatch.AttentionWorkload.from_lengths(
-        lengths,
-        padded_seqlen=padded_seqlen,
-        half_window=64,
-        global_layers=8,
-        local_layers=14,
-    )
+def _workload(lengths):
+    return attention_dispatch.AttentionWorkload.from_lengths(lengths)
 
 
-def test_workload_preserves_fixed_token_decomposition():
-    long = _workload((5000, 5000))
-    short = _workload((100,) * 100)
-    assert long.live_tokens == short.live_tokens == 10_000
-    assert long.global_pairs == 50_000_000
-    assert short.global_pairs == 1_000_000
-    assert long.effective_seqlen == 5000
-    assert short.effective_seqlen == 100
-    assert long.local_pairs == 1_281_680
-    assert short.local_pairs == 874_000
-
-
-def test_workload_uses_rectangular_sdpa_width():
-    workload = _workload((10, 20), padded_seqlen=32)
+def test_workload_retains_capture_safe_shape_statistics():
+    workload = _workload((10, 20, 5))
+    assert workload.n_sequences == 3
+    assert workload.live_tokens == 35
     assert workload.max_seqlen == 20
-    assert workload.padded_seqlen == 32
-    assert workload.live_tokens == 30
-    assert workload.padded_tokens == 64
-    assert workload.padding_tokens == 34
-    assert workload.dense_pairs == 2 * 32 * 32
+    assert workload.rectangle_tokens == 60
+    assert workload.fragmentation_tokens == 25
 
 
-def test_5090_policy_matches_calibrated_boundary():
-    policy = attention_dispatch.get_inference_policy((12, 0))
+def test_workload_rejects_impossible_summary():
+    try:
+        attention_dispatch.AttentionWorkload.from_summary(
+            n_sequences=2, live_tokens=33, max_seqlen=16
+        )
+    except ValueError:
+        pass
+    else:  # pragma: no cover - assertion spelling keeps pytest optional here
+        raise AssertionError("impossible packed workload was accepted")
+
+
+def test_5090_policy_matches_guarded_live_token_boundary():
+    policy = attention_dispatch.get_packed_inference_policy(
+        (12, 0), "NVIDIA GeForce RTX 5090"
+    )
     assert policy is not None
-    # High-confidence boundary reruns: the first member of each pair loses, the second wins.
-    assert not policy.use_flash(_workload((1024,)))
-    assert policy.use_flash(_workload((1024, 1024)))
-    assert not policy.use_flash(_workload((32,) * 128))
-    assert policy.use_flash(_workload((128,) * 32))
-    # The conservative line deliberately leaves the noisy marginal 64x64 point on SDPA.
-    assert not policy.use_flash(_workload((64,) * 64))
+    assert not policy.use_flash(_workload((128,) * 160))  # M=20,480
+    assert policy.use_flash(_workload((96,) * 216))       # M=20,736
 
 
-def test_5090_policy_credits_real_padding():
-    policy = attention_dispatch.get_inference_policy((12, 0))
-    equal = _workload((64,) * 64, padded_seqlen=64)
-    half = _workload((64, 32) * 32, padded_seqlen=64)
-    assert policy.score(half) > policy.score(equal)
-    assert not policy.use_flash(equal)
-    assert policy.use_flash(half)
-
-
-def test_a100_policy_matches_refined_fixed_token_boundary():
-    policy = attention_dispatch.get_inference_policy(
+def test_a100_policy_matches_refined_score_gap():
+    policy = attention_dispatch.get_packed_inference_policy(
         (8, 0), "NVIDIA A100-SXM4-40GB"
     )
     assert policy is not None
-    # Both contain 5k live tokens. The five longer sequences cross over; the ten
-    # shorter attention problems do not.
-    assert not policy.use_flash(_workload((500,) * 10))
-    assert policy.use_flash(_workload((1000,) * 5))
+    # Nearest rejected and selected rows under the rounded integer score.
+    assert not policy.use_flash(_workload((64, 32) * 192))
+    assert policy.use_flash(_workload((64, 32) * 256))
 
 
-def test_l40s_policy_matches_refined_boundary():
-    policy = attention_dispatch.get_inference_policy((8, 9), "NVIDIA L40S")
-    assert policy is not None
-    assert not policy.use_flash(_workload((256,) * 16))
-    assert policy.use_flash(_workload((512,) * 8))
-
-
-def test_b200_policy_uses_distribution_at_fixed_rectangle():
-    policy = attention_dispatch.get_inference_policy((10, 0), "NVIDIA B200")
-    assert policy is not None
-    equal = _workload((1024,) * 8)
-    half = _workload((1024, 512) * 4, padded_seqlen=1024)
-    assert equal.padded_tokens == half.padded_tokens == 8192
-    assert not policy.use_flash(equal)
-    assert policy.use_flash(half)
-
-
-def test_h200_policy_is_shared_with_h100_and_matches_refined_boundary():
-    h200 = attention_dispatch.get_inference_policy((9, 0), "NVIDIA H200")
-    h100 = attention_dispatch.get_inference_policy(
-        (9, 0), "NVIDIA H100 80GB HBM3"
+def test_l40s_policy_matches_refined_score_gap():
+    policy = attention_dispatch.get_packed_inference_policy(
+        (8, 9), "NVIDIA L40S"
     )
-    assert h200 is not None
-    assert h100 is h200
-    assert not h200.use_flash(_workload((1024,) * 8))
-    assert h200.use_flash(_workload((1024, 512) * 4, padded_seqlen=1024))
+    assert policy is not None
+    assert not policy.use_flash(_workload((64,) * 384))
+    assert policy.use_flash(_workload((128,) * 192))
 
 
-def test_resolver_uses_score_when_workload_is_supplied(monkeypatch):
-    policy = attention_dispatch.get_inference_policy((12, 0))
-    monkeypatch.setattr(attention_dispatch, "get_inference_policy", lambda: policy)
-    assert forward._resolve_eager_backend("auto", _workload((1024,))) == "sdpa"
-    assert (
-        forward._resolve_eager_backend("auto", _workload((1024, 1024)))
-        == "flash"
+def test_l40s_graph_policy_moves_only_the_validated_boundary_row():
+    eager = attention_dispatch.get_packed_inference_policy(
+        (8, 9), "NVIDIA L40S"
     )
-    assert forward._resolve_eager_backend("flash", _workload((1,))) == "flash"
+    graph = attention_dispatch.get_packed_inference_policy(
+        (8, 9), "NVIDIA L40S", for_cuda_graph=True
+    )
+    assert eager is not None and graph is not None
+    assert not eager.use_flash(_workload((64,) * 384))
+    assert graph.use_flash(_workload((64,) * 384))
+    assert not graph.use_flash(_workload((64,) * 320))
+    assert not graph.use_flash(_workload((32, 16) * 512))
+
+
+def test_h200_and_b200_use_bounded_no_crossover_policy():
+    for cc, name in (((9, 0), "NVIDIA H200"), ((10, 0), "NVIDIA B200")):
+        policy = attention_dispatch.get_packed_inference_policy(cc, name)
+        assert policy is not None
+        assert not policy.use_flash(_workload((128,) * 1024))  # measured M=131,072
+        assert policy.use_flash(_workload((128,) * 1024 + (1,)))
+
+
+def test_policies_do_not_transfer_to_uncalibrated_cards():
+    assert attention_dispatch.get_packed_inference_policy(
+        (12, 0), "some other sm120"
+    ) is None
+    assert attention_dispatch.get_packed_inference_policy(
+        (8, 0), "NVIDIA A30"
+    ) is None
+    assert attention_dispatch.get_packed_inference_policy(
+        (9, 0), "NVIDIA H100"
+    ) is None
+
+
+def test_resolver_uses_packed_score(monkeypatch):
+    policy = attention_dispatch.get_packed_inference_policy(
+        (12, 0), "NVIDIA RTX 5090"
+    )
+    monkeypatch.setattr(
+        attention_dispatch, "get_packed_inference_policy", lambda **_kwargs: policy
+    )
+    with torch.no_grad():
+        assert forward._resolve_eager_backend(
+            "auto", _workload((128,) * 160), triton_supported=True,
+            flash_available=True,
+        ) == "triton"
+        assert forward._resolve_eager_backend(
+            "auto", _workload((96,) * 216), triton_supported=True,
+            flash_available=True,
+        ) == "flash"
+        assert forward._resolve_eager_backend(
+            "auto", _workload((32,)), triton_supported=False,
+            flash_available=True,
+        ) == "flash"
+        assert forward._resolve_eager_backend(
+            "auto", _workload((32,)), triton_supported=True,
+            flash_available=False,
+        ) == "triton"
 
 
 def test_attention_workload_from_mask():
@@ -129,29 +138,11 @@ def test_attention_workload_from_mask():
     workload = forward._attention_workload(params, ids, mask)
     assert workload.n_sequences == 3
     assert workload.live_tokens == 15
-    assert workload.padded_seqlen == 8
-    assert workload.padding_tokens == 9
+    assert workload.max_seqlen == 8
+    assert workload.rectangle_tokens == 24
+    assert workload.fragmentation_tokens == 9
 
 
-def test_untested_cards_inherit_compute_capability_policy():
-    assert attention_dispatch.get_inference_policy(
-        (8, 0), "NVIDIA A30"
-    ) is attention_dispatch.get_inference_policy(
-        (8, 0), "NVIDIA A100-SXM4-40GB"
-    )
-    assert attention_dispatch.get_inference_policy(
-        (8, 9), "NVIDIA GeForce RTX 4090"
-    ) is attention_dispatch.get_inference_policy((8, 9), "NVIDIA L40S")
-    assert attention_dispatch.get_inference_policy(
-        (10, 0), "some other sm100"
-    ) is attention_dispatch.get_inference_policy((10, 0), "NVIDIA B200")
-    assert attention_dispatch.get_inference_policy((9, 0)) is not None
-
-
-def test_unknown_compute_capability_uses_generic_score(monkeypatch):
-    generic = attention_dispatch.get_inference_policy((12, 0))
-    assert attention_dispatch.get_inference_policy(
-        (8, 6), "NVIDIA GeForce RTX 3090"
-    ) is generic
+def test_no_cuda_device_has_no_policy(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    assert attention_dispatch.get_inference_policy() is None
+    assert attention_dispatch.get_packed_inference_policy() is None

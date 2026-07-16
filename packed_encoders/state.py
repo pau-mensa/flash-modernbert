@@ -22,7 +22,7 @@ ATTR = "_packed_encoders"
 class PatchState:
     params: ModernBertParams
     original_forward: Callable[..., Any]
-    # "sdpa" (dep-free) | "flash" | "auto" (calibrated eager score, legacy S fallback)
+    # "sdpa" (general fallback) | "flash" | "triton" | "auto" (packed score)
     attention_backend: str = "sdpa"
     graph_runner: Any = None        # graph._GraphRunner | None (kept loose to avoid a cycle)
     graph_enabled: bool = False
