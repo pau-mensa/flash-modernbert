@@ -267,7 +267,7 @@ def test_end_to_end_pack_train_graph_engages_and_matches_eager():
     backward bit-exactly. (The graph captures the dense-mask forward; comparing to
     the *default* flash-path forward would instead surface the bf16 dense-vs-flash
     backward band, which is characterized in the benchmarks, not gated here.)"""
-    import packed_encoders as fm
+    import packed_encoders as pe
     from packed_encoders import forward
     from packed_encoders.config import ModernBertParams
     from transformers import AutoModel
@@ -280,7 +280,7 @@ def test_end_to_end_pack_train_graph_engages_and_matches_eager():
         p.grad = torch.zeros_like(p)
     ids, mask, grad_seed = _batch(16, 32, model.config.vocab_size, seed=21)
 
-    fm.pack(model, train_cuda_graph=True, validate=False)
+    pe.pack(model, train_cuda_graph=True, validate=False)
 
     # A real fwd+bwd through the patched forward (grad on → routes to train runner).
     for p in w:

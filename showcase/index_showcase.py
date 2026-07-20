@@ -38,7 +38,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-import packed_encoders as fm
+import packed_encoders as pe
 from _common import RESULTS_DIR, device_banner, load_agentir_passages, load_config
 from packed_encoders.locate import find_encoder
 from packed_index import (
@@ -55,7 +55,7 @@ from packed_index import (
 # Grouped by the two figures the showcase produces.  Late interaction (PyLate)
 # emits one embedding per retained document token; single vector (ST) emits one
 # pooled embedding per document.  Within each family the four bars are the same
-# comparison: eager stock, strongest compiled stock encoder, drop-in `fm.pack`
+# comparison: eager stock, strongest compiled stock encoder, drop-in `pe.pack`
 # padded, and a fully packed encoder/index.
 LATE_INTERACTION = (
     "pylate_eager",
@@ -381,7 +381,7 @@ def _build_variant(variant: str, cfg: dict, docs: list[str]):
                 dynamic=variant == "st_compile_dynamic",
             )
         elif variant in ("st_pack", "st_packed"):
-            fm.pack(model, attention_backend="flash", validate=False)
+            pe.pack(model, attention_backend="flash", validate=False)
         model_load_s = time.perf_counter() - load_start
         token_start = time.perf_counter()
         tokens = _tokenized_st(model, docs, document_length)
@@ -413,7 +413,7 @@ def _build_variant(variant: str, cfg: dict, docs: list[str]):
                 dynamic=variant == "pylate_compile_dynamic",
             )
         elif variant == "pylate_pack":
-            fm.pack(model, attention_backend="flash", validate=False)
+            pe.pack(model, attention_backend="flash", validate=False)
         model_load_s = time.perf_counter() - load_start
         token_start = time.perf_counter()
         tokens = tokenize_colbert_no_padding(model, docs, is_query=False)

@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-import packed_encoders as fm
+import packed_encoders as pe
 from _common import RESULTS_DIR, device_banner, ema, load_config, new_figure
 from packed_encoders import forward
 from packed_encoders.config import ModernBertParams
@@ -39,7 +39,7 @@ from packed_index import tokenize_colbert_no_padding
 FAMILIES = ("late_interaction", "single_vector")
 VARIANTS = ("stock", "pack", "packed")
 COMPILED_VARIANTS = frozenset(("pack", "packed"))
-LABELS = {"stock": "Stock", "pack": "fm.pack", "packed": "Packed"}
+LABELS = {"stock": "Stock", "pack": "pe.pack", "packed": "Packed"}
 COLORS = {"stock": "#3b6ea5", "pack": "#6a4c93", "packed": "#d1495b"}
 
 
@@ -99,7 +99,7 @@ def _load_model(cfg: dict, family: str, variant: str):
         tokenizer = AutoTokenizer.from_pretrained(name)
         model = AutoModel.from_pretrained(name, dtype=torch.bfloat16).cuda()
     if variant == "pack":
-        fm.pack(model, attention_backend="flash", validate=False)
+        pe.pack(model, attention_backend="flash", validate=False)
     return model.train(), tokenizer
 
 
@@ -253,7 +253,7 @@ def _probe_loss(cfg, family, model, tokenizer, batch):
     try:
         with torch.inference_mode():
             # packed_forward directly reads the encoder weights, bypassing both
-            # the stock padded forward and fm.pack's patched forward.  This
+            # the stock padded forward and pe.pack's patched forward.  This
             # makes step-zero and subsequent probe losses directly comparable.
             return _loss(cfg, family, "packed", model, tokenizer, batch).detach()
     finally:

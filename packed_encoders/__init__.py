@@ -6,9 +6,9 @@ RoPE, and GeGLU; cuBLAS GEMMs; vendor SDPA attention) onto a live Hugging Face
 the speedup with no per-framework adapter. CUDA graphs are an optional layer on
 top, off by default.
 
-    import packed_encoders as fm
-    fm.pack(model)                 # eager fused forward
-    fm.pack(model, cuda_graph=True)  # bucketed CUDA graphs
+    import packed_encoders as pe
+    pe.pack(model)                 # eager fused forward
+    pe.pack(model, cuda_graph=True)  # bucketed CUDA graphs
 """
 
 from __future__ import annotations

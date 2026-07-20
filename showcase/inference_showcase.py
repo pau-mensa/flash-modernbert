@@ -13,7 +13,7 @@
 # url = "https://download.pytorch.org/whl/cu128"
 # explicit = true
 # ///
-"""Serving-throughput comparison: eager/compiled stock vs fm.pack vs packed.
+"""Serving-throughput comparison: eager/compiled stock vs pe.pack vs packed.
 
 Two endpoints, measured independently in process-isolated workers:
 
@@ -28,7 +28,7 @@ Four variants per model family (late interaction / single vector):
 * Eager stock: unmodified dynamically padded encoder.
 * Compiled stock (``max-autotune``, ``dynamic=True``): strongest deployer
   baseline.
-* ``fm.pack`` (flash attention; +CUDA graph on query endpoint): drop-in.
+* ``pe.pack`` (flash attention; +CUDA graph on query endpoint): drop-in.
 * Packed (``packed_forward`` / segment mean-pool): paradigm.
 
 Each variant runs in a fresh subprocess with a clean ``TORCHINDUCTOR_CACHE_DIR``.
@@ -52,7 +52,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-import packed_encoders as fm
+import packed_encoders as pe
 from _common import (
     RESULTS_DIR,
     device_banner,
@@ -353,10 +353,10 @@ def _measure(
 # ---------------------------------------------------------------------------
 
 
-def _graph_config(ep_cfg: dict, max_seq: int) -> fm.GraphConfig | bool:
+def _graph_config(ep_cfg: dict, max_seq: int) -> pe.GraphConfig | bool:
     if not ep_cfg.get("cuda_graph", False):
         return False
-    return fm.GraphConfig(
+    return pe.GraphConfig(
         pad_to=int(ep_cfg.get("cuda_graph_pad_to", 32)),
         max_seq=max_seq,
         max_batch=int(ep_cfg.get("batch_size", 8)),
@@ -391,7 +391,7 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.pack(
+            pe.pack(
                 model,
                 attention_backend="flash",
                 validate=False,
@@ -401,7 +401,7 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.pack(
+            pe.pack(
                 model,
                 attention_backend="flash",
                 validate=False,
@@ -442,7 +442,7 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.pack(
+            pe.pack(
                 model,
                 attention_backend="flash",
                 validate=False,
@@ -452,7 +452,7 @@ def _build_variant(variant: str, cfg: dict, texts: list[str], endpoint: str):
             graph_cfg = (
                 _graph_config(ep_cfg, query_length) if is_query else False
             )
-            fm.pack(
+            pe.pack(
                 model,
                 attention_backend="flash",
                 validate=False,

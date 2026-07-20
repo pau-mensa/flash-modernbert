@@ -145,15 +145,15 @@ needs_flash = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def models():
-    import packed_encoders as fm
+    import packed_encoders as pe
     from transformers import AutoModel
 
     tok = __import__("transformers").AutoTokenizer.from_pretrained(MODEL_ID)
     stock = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
     flash = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
-    fm.pack(flash, attention_backend="flash", validate=False)
+    pe.pack(flash, attention_backend="flash", validate=False)
     sdpa = AutoModel.from_pretrained(MODEL_ID, dtype=torch.bfloat16).cuda().eval()
-    fm.pack(sdpa, attention_backend="sdpa", validate=False)
+    pe.pack(sdpa, attention_backend="sdpa", validate=False)
     return tok, stock, flash, sdpa
 
 

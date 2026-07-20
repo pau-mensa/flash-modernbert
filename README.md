@@ -11,11 +11,11 @@ Face, SentenceTransformers, and PyLate inherit the speedup with no per-framework
 adapter.
 
 ```python
-import packed_encoders as fm
+import packed_encoders as pe
 from transformers import AutoModel
 
 model = AutoModel.from_pretrained("answerdotai/ModernBERT-base", dtype="bfloat16").cuda()
-fm.pack(model)                      # eager fused forward (default)
+pe.pack(model)                      # eager fused forward (default)
 out = model(input_ids=ids, attention_mask=mask).last_hidden_state
 ```
 
@@ -32,7 +32,7 @@ inside a `SentenceTransformer` or a PyLate `ColBERT` and patches it:
 ```python
 from sentence_transformers import SentenceTransformer
 st = SentenceTransformer("some-modernbert-model").cuda().bfloat16()
-fm.pack(st)
+pe.pack(st)
 emb = st.encode(texts)
 ```
 
@@ -43,16 +43,16 @@ the bucketed CUDA-graph runner collapses the launch floor to a single replay:
 
 ```python
 # Rectangular graph (dynamic padding remains a dense SDPA mask):
-fm.pack(model, cuda_graph=True, attention_backend="sdpa")
+pe.pack(model, cuda_graph=True, attention_backend="sdpa")
 
 # Already-packed auto/Triton graph needs fixed sequence-count and S bounds:
-fm.pack(model, cuda_graph=fm.GraphConfig(
+pe.pack(model, cuda_graph=pe.GraphConfig(
     pad_to=64, max_batch=256, max_seq=128, max_graphs=32,
 ))
 
-with fm.no_cuda_graph(model):          # bypass graphs for a one-off odd shape
+with pe.no_cuda_graph(model):          # bypass graphs for a one-off odd shape
     out = model(input_ids=huge_ids, attention_mask=huge_mask)
-fm.set_cuda_graph(model, False)        # or flip after the fact
+pe.set_cuda_graph(model, False)        # or flip after the fact
 ```
 
 The kill switch `PACKED_ENCODERS_GRAPH=0` disables graphs globally. Out-of-bucket

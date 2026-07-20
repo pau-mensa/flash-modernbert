@@ -431,7 +431,7 @@ def packed_forward(
     unchanged: attention takes `cu_seqlens` (confining it within each sequence) and RoPE
     takes per-token-gathered cos/sin.
 
-    When ``fm.pack(cuda_graph=...)`` is active, the packed graph runner captures this
+    When ``pe.pack(cuda_graph=...)`` is active, the packed graph runner captures this
     function at a fixed token budget and replays on subsequent calls, eliminating all
     per-kernel dispatch overhead.  Falls back to eager when inputs exceed the graph
     budget or when grad/autocast is enabled.
