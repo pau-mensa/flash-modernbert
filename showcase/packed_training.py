@@ -337,7 +337,7 @@ def gradcache_step(
     d_cache, d_states = _cache_role(model, batch.documents, mini_batch_size, packed)
     labels = batch.labels.to(device)
 
-    from flash_maxsim import flash_maxsim_packed_batched_train
+    from flash_maxsim_packed import flash_maxsim_packed_batched_train
 
     cu_d = batch.documents.scoring_cu_seqlens(device)
     if packed:

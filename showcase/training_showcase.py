@@ -204,7 +204,7 @@ def _loss(cfg, family, variant, model, tokenizer, batch):
     if family == "late_interaction":
         temperature = float(cfg.get("loss", {}).get("late_interaction_temperature", 0.01))
         if variant == "packed":
-            from flash_maxsim import flash_maxsim_packed_batched_train
+            from flash_maxsim_packed import flash_maxsim_packed_batched_train
 
             q_values, cu_q, max_q = _colbert_packed(model, q, q_masks)
             d_values, cu_d, max_d = _colbert_packed(model, d, d_masks)
