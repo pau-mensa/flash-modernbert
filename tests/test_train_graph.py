@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10,<3.14"
+# requires-python = ">=3.10,<3.15"
 # dependencies = ["packed-encoders", "transformers", "pytest"]
 #
 # [tool.uv.sources]

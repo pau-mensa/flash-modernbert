@@ -217,6 +217,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# local clone of upstream flash-maxsim (packed kernel is vendored in
+# showcase/flash_maxsim_packed.py; the padded baseline comes from the
+# pip-installed upstream package)
+flash-maxsim/
+
 # benchmark artifacts
 benchmarks/results/
 showcase/results/
