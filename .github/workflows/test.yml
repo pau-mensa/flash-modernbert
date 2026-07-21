@@ -1,0 +1,50 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+          enable-cache: true
+
+      # Hosted runners do not have GPUs. Installing the CPU wheel keeps the
+      # pure-logic tests useful while the CUDA tests use their existing skips.
+      - name: Install dependencies
+        run: |
+          if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
+            torch_requirement="torch>=2.9,<2.10"
+          else
+            torch_requirement="torch>=2.8,<2.9"
+          fi
+          uv pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            "$torch_requirement"
+          uv pip install -e . pytest
+
+      - name: Run tests
+        run: pytest tests/
