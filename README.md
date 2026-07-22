@@ -1,5 +1,8 @@
 <div align="center">
-  <h1>packed-encoders</h1>
+  <h1>Packed Encoders</h1>
+  <p align="center">
+      <img src="benchmarks/docs/assets/pe_banner.png" alt="packed-encoders Logo">
+  </p>
 </div>
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg" alt="Python Versions">
@@ -11,7 +14,7 @@
   <a href="https://github.com/triton-lang/triton"><img src="https://img.shields.io/badge/Triton-%23000000.svg?style=for-the-badge&logo=openai&logoColor=white" alt="Triton"></a>
 </p>
 <div align="center">
-  One line, any framework, no padding, no lock-in.
+    A padding-free runtime for Encoders
 </div>
 
 &nbsp;
