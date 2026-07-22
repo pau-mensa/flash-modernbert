@@ -1,7 +1,7 @@
 [project]
 name = "packed-encoders"
 version = "0.1.0"
-description = "Fused-tail CuteDSL encoder for ModernBERT / mmBERT — monkeypatches Hugging Face, SentenceTransformers, and PyLate in place."
+description = "A padding-free runtime for Encoders"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 license = { file = "LICENSE" }
