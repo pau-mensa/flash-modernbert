@@ -22,7 +22,7 @@
 
 The kernels consume Hugging Face's exact weight layout, so nothing is re-packed and no wrapper class exists. `state_dict`, `save_pretrained`, `from_pretrained`, and gradient checkpointing all remain HF's own (or any other wrappers on top of HF). `pe.unpack(model)` restores the stock forward.
 
-**Inference**: **1.8–2.2x** document encoding and **2.6–2.7x** query encoding vs eager Hugging Face on an RTX 5090 (**1.3–1.5x** vs `torch.compile` max-autotune), at cosine ≥ 0.999 output parity.
+**Inference**: **1.9–2.1x** document encoding and **2.5–2.6x** query encoding vs eager Hugging Face on an RTX 5090 (**1.3–1.5x** vs `torch.compile` max-autotune), at cosine ≥ 0.999 output parity.
 
 **Indexing**: **2.9–3.3x** documents/second on a real long-document corpus, with **~26% less** peak reserved VRAM.
 
@@ -31,7 +31,7 @@ The kernels consume Hugging Face's exact weight layout, so nothing is re-packed 
 Check the [benchmark section](#benchmarks) for the full tables.
 
 > [!NOTE]  
-> ModernBERT backbones at `hidden_size` divisible by 256 are supported, this includes the obvious [ModernBERT](https://huggingface.co/answerdotai/ModernBERT-base) but also: any encoder trained with the same architecture (such as [Ettin](https://huggingface.co/jhu-clsp/ettin-encoder-1b) or [mmBERT](https://huggingface.co/jhu-clsp/mmBERT-base)), late-interaction encoders trained with ModernBERT as the base (such as [ModernColBERT](https://huggingface.co/lightonai/GTE-ModernColBERT-v1)) and any finetunes that sit on top of those. The package offers a `validate()` function to check compatibility
+> ModernBERT backbones at `hidden_size` divisible by 256 are supported, this includes the obvious [ModernBERT](https://huggingface.co/answerdotai/ModernBERT-base) but also: any encoder trained with the same architecture (such as [Ettin](https://huggingface.co/jhu-clsp/ettin-encoder-1b) or [mmBERT](https://huggingface.co/jhu-clsp/mmBERT-base)), late-interaction encoders trained with ModernBERT as the base (such as [ModernColBERT](https://huggingface.co/lightonai/GTE-ModernColBERT-v1)) and any finetunes that sit on top of those. The package offers a `validate()` function to check compatibility.
 
 &nbsp;
 
@@ -46,28 +46,29 @@ packed-encoders removes that waste in three layers, each usable independently:
 3. **Dispatch and graphs** — a per-GPU calibrated policy picks between a specialized packed Triton attention kernel and FlashAttention per batch, and optional bucketed CUDA graphs collapse the kernel-launch floor for short-sequence workloads.
 
 ## Installation
-Install from PyPI:
 
+Install from PyPI:
+```bash
+uv pip install packed-encoders
+```
 
 or install from source:
-
 ```bash
 git clone git@github.com:pau-mensa/packed-encoders.git
 cd packed-encoders
 uv sync                 # torch 2.8 (cu128) + transformers + CuteDSL
-uv sync --extra fa2     # + compiled FlashAttention 2 (sm_120 / RTX 5090)
+uv sync --extra fa2     # + compiled FlashAttention 2 (sm_120 / RTX 5090, Python 3.11)
 uv sync --extra fa4     # + CuteDSL FlashAttention 4 (sm_90 / sm_100)
 ```
 
 or straight into an existing environment:
-
 ```bash
 uv pip install "packed-encoders @ git+https://github.com/pau-mensa/packed-encoders"
 ```
 
 Notes on the pins:
 
-- **torch is pinned to the 2.8 series on Python 3.10–3.13** because the FlashAttention backend on consumer Blackwell (sm_120) uses a prebuilt `flash-attn` wheel that is ABI-locked to torch 2.8. Python 3.14 uses torch 2.9, the first release with cp314 wheels; use the in-tree Triton or SDPA backend there (though not recommended).
+- **torch is pinned to the 2.8 series on Python 3.10–3.13**. The prebuilt FlashAttention wheel for consumer Blackwell (sm_120) is ABI-locked to torch 2.8 and Python 3.11; on other Python versions use the in-tree Triton or SDPA backend. Python 3.14 uses torch 2.9, the first release with cp314 wheels.
 - On **sm_90 / sm_100** (H100/H200/B200) install `flash-attn-4` instead, the loader auto-selects the CuteDSL FA4 kernel there.
 - FlashAttention is optional: the packed Triton kernel ships in-tree and SDPA needs no extra dependency. On large token budgets (large batches or long documents) FA is heavily recommended.
 - Framework extras (`--extra sentence-transformers`, `--extra pylate`) exist for convenience; the package only requires them if you actually pass those objects to `pack()`.
@@ -101,7 +102,7 @@ out = model(input_ids=ids, attention_mask=mask).last_hidden_state
   from pylate import models
   colbert = models.ColBERT(model_name_or_path="lightonai/GTE-ModernColBERT-v1")
 + pe.pack(colbert)
-  train_loss = losses.CachedContrastive(model=model, ...)
+  train_loss = losses.CachedContrastive(model=colbert, ...)
 ```
 
 ## Usage
@@ -119,7 +120,7 @@ pe.pack(model, attention_backend="auto")   # default when an optimized kernel is
 | `"flash"` | FlashAttention with sliding-window pruning; varlen kernel on padded batches. FA2 wheel on sm_120, CuteDSL FA4 on sm_90/sm_100. Raises if no kernel is present. |
 | `"sdpa"` | Dependency-free dense-mask attention. The explicit safe choice and the final fallback. |
 
-The dispatch policy uses only host-visible shapes (never device values, so it stays CUDA-graph-capturable) and was fit per card against measured crossovers: on the RTX 5090 the Triton kernel wins below **20,736 live tokens** and FA2 above; at the kernel level the specialized Triton kernel is **1.4–2.1x** faster than FA2 in its envelope. Policies are exact-card and backend-version specific by design — see [`docs/attention_dispatch_score.md`](docs/attention_dispatch_score.md) for the formulas, sweeps, and parity numbers.
+The dispatch policy uses only host-visible shapes (never device values, so it stays CUDA-graph-capturable) and was fit per card against measured crossovers: on the RTX 5090 the Triton kernel wins below **20,736 live tokens** and FA2 above; at the kernel level the specialized Triton kernel is **1.4–2.1x** faster than FA2 in its envelope. Policies are exact-card and backend-version specific by design — see the [`benchmarks/` guide](benchmarks/README.md) for the formulas, sweeps, parity numbers, and reproduction commands.
 
 ### CUDA graphs
 
@@ -129,7 +130,7 @@ The package also offers the possibility of using CUDA graphs for short-sequence 
 # Rectangular graphs over padded (B, S) buckets:
 pe.pack(model, cuda_graph=True, attention_backend="sdpa")
 
-# Packed graphs (auto/triton/flash) need explicit token budgets:
+# Packed graphs (auto/triton/flash) need explicit batch and sequence bounds:
 pe.pack(model, cuda_graph=pe.GraphConfig(
     pad_to=64, max_batch=256, max_seq=128, max_graphs=32,
 ))
@@ -164,6 +165,8 @@ with two caller invariants: `optimizer.zero_grad(set_to_none=False)` (the backwa
 3. that the CuteDSL toolchain can JIT a kernel on this machine;
 4. that the fused forward tracks stock HF within the bf16 band (cosine ≥ 0.997 at S = 128/512/2048).
 
+The packed forward requires `input_ids`; `inputs_embeds`, attention/hidden-state outputs, and non-zero `token_type_ids` are not supported.
+
 ### Fully packed execution (advanced)
 
 `pack()` keeps the public padded interface. If your pipeline already collates without padding, `packed_forward()` is the direct entry:
@@ -182,14 +185,17 @@ position_ids = torch.cat([torch.arange(n) for n in (5, 3, 8)]).cuda()       # [1
 hidden = packed_forward(model, params, packed_ids, cu_seqlens, 8, position_ids)  # [16, H]
 ```
 
-> [!IMPORTANT]  
+> [!IMPORTANT]
 > If you want to use it for training you'll also have to use a custom packed loss as well.
 
 &nbsp;
 
 ## Benchmarks
 
-All numbers come from real `Tevatron/AgentIR-data` queries and long documents, are PyTorch-vs-PyTorch comparisons, and report peak **reserved** VRAM. Every accelerated path is parity-checked against eager stock before a result is published (cosine ≥ 0.9996 on these runs). Configs and runners live in [`showcase/`](showcase/); protocol docs in [`docs/`](docs/).
+All numbers come from real `Tevatron/AgentIR-data` queries and long documents, are PyTorch-vs-PyTorch comparisons, and report peak **reserved** VRAM. Every accelerated path is parity-checked against eager stock before a result is published (cosine ≥ 0.999 on these runs). Configs and runners live in [`showcase/`](showcase/); each showcase has a checked-in protocol and canonical config.
+
+> [!IMPORTANT]
+> These benchmarks were done on a 5090 and a B200 and are just the headline. You should measure your own use case and pick the config that works best for you.
 
 ### Inference (RTX 5090, batch 8)
 
@@ -197,12 +203,16 @@ Queries are capped at 128 tokens (dispatch-bound; CUDA graphs enabled on the pac
 
 | Endpoint | Model family | Eager HF | `torch.compile` | `pe.pack` | Fully packed |
 |---|---|---:|---:|---:|---:|
-| Queries (≤128) | ColBERT (PyLate) | 1,441 | 2,833 | 3,507 | **3,602 (+150%)** |
-| Queries (≤128) | single-vector (ST) | 1,370 | 2,614 | 3,149 | **3,572 (+160%)** |
-| Documents (≤2048) | ColBERT (PyLate) | 232 | 329 | 473 | **480 (+106%)** |
-| Documents (≤2048) | single-vector (ST) | 207 | 281 | 379 | **388 (+87%)** |
+| Queries (≤128) | ColBERT (PyLate) | 1,370 | 2,614 | 3,149 | **3,572 (+160%)** |
+| Queries (≤128) | single-vector (ST) | 1,441 | 2,833 | 3,507 | **3,602 (+150%)** |
+| Documents (≤2048) | ColBERT (PyLate) | 207 | 281 | 379 | **388 (+87%)** |
+| Documents (≤2048) | single-vector (ST) | 232 | 329 | 473 | **480 (+106%)** |
 
-On documents the packed path is faster *and* leaner than eager (0.96 vs 1.04 GB reserved). On queries the graphed packed path deliberately trades memory for throughput (~1.3–1.5 GB reserved vs ~0.4–0.5 eager). The query-side headline is unlocked by the packed Triton short-attention kernel: the same packed path forced onto FlashAttention measures ~1,500 seqs/s.
+On documents the packed path is faster *and* leaner than eager (0.80-0.85 vs 0.82-1.04 GB reserved). On queries the graphed packed path deliberately trades memory for throughput (~1.2-1.4 GB reserved vs ~0.4-0.5 eager).
+
+![RTX 5090 query inference benchmark](docs/assets/inference_5090_query.png)
+
+![RTX 5090 document inference benchmark](docs/assets/inference_5090_document.png)
 
 ### Indexing (RTX 5090, batch 128, documents ≤2048)
 
@@ -213,23 +223,47 @@ On documents the packed path is faster *and* leaner than eager (0.96 vs 1.04 GB 
 
 The fully packed late-interaction index is also **2.15x smaller** on disk (60 MB vs 129 MB for the same corpus) because no rectangular token tensor or mask is stored.
 
+![RTX 5090 late-interaction indexing benchmark](docs/assets/index_5090_b128_late_interaction.png)
+
+![RTX 5090 single-vector indexing benchmark](docs/assets/index_5090_b128_single_vector.png)
+
 ### Training (NVIDIA B200)
 
-Late interaction: the Agent-ModernColBERT recipe — `lightonai/GTE-ModernColBERT-v1`, GradCache (CachedContrastive), B=32 with 7 negatives, query/document caps 8192/4096, 326 optimizer steps over two epochs:
+#### Multi-vector (late interaction)
+
+The Agent-ModernColBERT recipe — `lightonai/GTE-ModernColBERT-v1`, GradCache (CachedContrastive), B=32 with 7 negatives, query/document caps 8192/4096, 326 optimizer steps over two epochs:
 
 | | Stock | `pe.pack` | Fully packed |
 |---|---:|---:|---:|
-| Median step time | 10,665 ms | 1,817 ms (**5.9x**) | 1,521 ms (**7.0x**) |
+| Median step time | 10,518 ms | 1,812 ms (**5.8x**) | 1,516 ms (**7.0x**) |
 | Wall clock, *including* all compile warmup | 65m 06s | 16m 39s (**3.91x**) | 14m 18s (**4.55x**) |
 | Per-step peak reserved | 26.7 GB | 17.2 GB (−36%) | 16.9 GB (−37%) |
 
-Single vector (`gte-modernbert-base`, full in-batch negatives, B=16, caps 128/2048): step time 1,216 → 271 → 270 ms (**4.5x**), per-step reserved 176.5 → 91.8 → 91.2 GB (**−48%**).
+![B200 multi-vector training loss](docs/assets/training_b200_late_interaction_iso_loss.png)
 
-All variants start from a bit-identical initial probe loss and follow the same per-step optimization trajectory — the speedup is pure wall-clock, not a different training run.
+![B200 multi-vector training memory](docs/assets/training_b200_late_interaction_memory.png)
+
+#### Single vector
+
+`gte-modernbert-base`, full in-batch negatives, B=16, query/document caps 128/2048, 650 optimizer steps over two epochs:
+
+| | Stock | `pe.pack` | Fully packed |
+|---|---:|---:|---:|
+| Median step time | 1,216 ms | 271 ms (**4.5x**) | 270 ms (**4.5x**) |
+| Per-step peak reserved | 176.5 GB | 91.8 GB (−48%) | 91.2 GB (−48%) |
+
+![B200 single-vector training loss](docs/assets/training_b200_single_vector_iso_loss.png)
+
+![B200 single-vector training memory](docs/assets/training_b200_single_vector_memory.png)
+
+All variants start from a bit-identical initial probe loss and follow comparable optimization trajectories under the same data and training configuration.
+
+> [!NOTE]
+> The B200 showcase was measured with PyTorch 2.11; the package's supported installation matrix is PyTorch 2.8–2.9. See the training protocol for the complete benchmark environment.
 
 ### Reproducibility
 
-Each result above is one checked-in config + runner + JSON + plot. See [`showcase/README.md`](showcase/README.md) and the per-showcase docs ([inference](docs/inference_showcase.md), [indexing](docs/index_showcase.md), [training](docs/training_showcase.md), [mixed serving](docs/mixed_workload_serving_showcase.md)) for the exact protocol, environment, and parity gates.
+The runners and canonical configs are checked in; the figures above are snapshots from the published reference runs. See the protocols for [inference](docs/inference_showcase.md), [indexing](docs/index_showcase.md), and [training](docs/training_showcase.md) for the exact environment, methodology, and parity gates. Attention crossover calibration is documented separately in [`benchmarks/`](benchmarks/README.md).
 
 &nbsp;
 
