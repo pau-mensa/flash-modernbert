@@ -192,7 +192,7 @@ hidden = packed_forward(model, params, packed_ids, cu_seqlens, 8, position_ids) 
 
 ## Benchmarks
 
-All numbers come from real `Tevatron/AgentIR-data` queries and long documents, are PyTorch-vs-PyTorch comparisons, and report peak **reserved** VRAM. Every accelerated path is parity-checked against eager stock before a result is published (cosine ≥ 0.999 on these runs). Configs and runners live in [`showcase/`](showcase/); each showcase has a checked-in protocol and canonical config.
+All numbers come from real `Tevatron/AgentIR-data` queries and long documents, are PyTorch-vs-PyTorch comparisons, and report peak **reserved** VRAM. Every accelerated path is parity-checked against eager stock before a result is published (cosine ≥ 0.999 on these runs). Configs, runners, protocols, and remote launchers live in [`benchmarks/`](benchmarks/README.md).
 
 > [!IMPORTANT]
 > These benchmarks were done on a 5090 and a B200 and are just the headline. You should measure your own use case and pick the config that works best for you.
@@ -210,9 +210,9 @@ Queries are capped at 128 tokens (dispatch-bound; CUDA graphs enabled on the pac
 
 On documents the packed path is faster *and* leaner than eager (0.80-0.85 vs 0.82-1.04 GB reserved). On queries the graphed packed path deliberately trades memory for throughput (~1.2-1.4 GB reserved vs ~0.4-0.5 eager).
 
-![RTX 5090 query inference benchmark](docs/assets/inference_5090_query.png)
+![RTX 5090 query inference benchmark](benchmarks/docs/assets/inference_5090_query.png)
 
-![RTX 5090 document inference benchmark](docs/assets/inference_5090_document.png)
+![RTX 5090 document inference benchmark](benchmarks/docs/assets/inference_5090_document.png)
 
 ### Indexing (RTX 5090, batch 128, documents ≤2048)
 
@@ -223,9 +223,9 @@ On documents the packed path is faster *and* leaner than eager (0.80-0.85 vs 0.8
 
 The fully packed late-interaction index is also **2.15x smaller** on disk (60 MB vs 129 MB for the same corpus) because no rectangular token tensor or mask is stored.
 
-![RTX 5090 late-interaction indexing benchmark](docs/assets/index_5090_b128_late_interaction.png)
+![RTX 5090 late-interaction indexing benchmark](benchmarks/docs/assets/index_5090_b128_late_interaction.png)
 
-![RTX 5090 single-vector indexing benchmark](docs/assets/index_5090_b128_single_vector.png)
+![RTX 5090 single-vector indexing benchmark](benchmarks/docs/assets/index_5090_b128_single_vector.png)
 
 ### Training (NVIDIA B200)
 
@@ -239,9 +239,9 @@ The Agent-ModernColBERT recipe — `lightonai/GTE-ModernColBERT-v1`, GradCache (
 | Wall clock, *including* all compile warmup | 65m 06s | 16m 39s (**3.91x**) | 14m 18s (**4.55x**) |
 | Per-step peak reserved | 26.7 GB | 17.2 GB (−36%) | 16.9 GB (−37%) |
 
-![B200 multi-vector training loss](docs/assets/training_b200_late_interaction_iso_loss.png)
+![B200 multi-vector training loss](benchmarks/docs/assets/training_b200_late_interaction_iso_loss.png)
 
-![B200 multi-vector training memory](docs/assets/training_b200_late_interaction_memory.png)
+![B200 multi-vector training memory](benchmarks/docs/assets/training_b200_late_interaction_memory.png)
 
 #### Single vector
 
@@ -252,9 +252,9 @@ The Agent-ModernColBERT recipe — `lightonai/GTE-ModernColBERT-v1`, GradCache (
 | Median step time | 1,216 ms | 271 ms (**4.5x**) | 270 ms (**4.5x**) |
 | Per-step peak reserved | 176.5 GB | 91.8 GB (−48%) | 91.2 GB (−48%) |
 
-![B200 single-vector training loss](docs/assets/training_b200_single_vector_iso_loss.png)
+![B200 single-vector training loss](benchmarks/docs/assets/training_b200_single_vector_iso_loss.png)
 
-![B200 single-vector training memory](docs/assets/training_b200_single_vector_memory.png)
+![B200 single-vector training memory](benchmarks/docs/assets/training_b200_single_vector_memory.png)
 
 All variants start from a bit-identical initial probe loss and follow comparable optimization trajectories under the same data and training configuration.
 
@@ -263,7 +263,7 @@ All variants start from a bit-identical initial probe loss and follow comparable
 
 ### Reproducibility
 
-The runners and canonical configs are checked in; the figures above are snapshots from the published reference runs. See the protocols for [inference](docs/inference_showcase.md), [indexing](docs/index_showcase.md), and [training](docs/training_showcase.md) for the exact environment, methodology, and parity gates. Attention crossover calibration is documented separately in [`benchmarks/`](benchmarks/README.md).
+The runners and canonical configs are checked in; the figures above are snapshots from the published reference runs. See the protocols for [inference](benchmarks/docs/inference.md), [indexing](benchmarks/docs/indexing.md), and [training](benchmarks/docs/training.md) for the exact environment, methodology, and parity gates. Attention crossover calibration is documented in the same [`benchmarks/` guide](benchmarks/README.md).
 
 &nbsp;
 
@@ -300,4 +300,4 @@ Contributions are welcome, especially for:
 
 ## License
 
-MIT. [`showcase/flash_maxsim_packed.py`](showcase/flash_maxsim_packed.py) builds on [flash-maxsim](https://github.com/roipony/flash-maxsim), which is licensed under Apache-2.0.
+MIT. [`benchmarks/helpers/flash_maxsim_packed.py`](benchmarks/helpers/flash_maxsim_packed.py) builds on [flash-maxsim](https://github.com/roipony/flash-maxsim), which is licensed under Apache-2.0.

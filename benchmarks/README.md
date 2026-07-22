@@ -1,4 +1,34 @@
-# Attention dispatch benchmarks
+# Benchmarks and showcases
+
+This directory is the reproducibility surface for packed-encoders. It contains
+the end-to-end published showcases, their canonical configurations and figures,
+the lower-level attention benchmarks, and the remote launchers used to run them.
+Generated JSON results and downloaded datasets stay under the ignored
+`benchmarks/results/` and `benchmarks/data_cache/` directories.
+
+## Published showcases
+
+| Workload | Hardware | Protocol | Runner | Canonical config |
+|---|---|---|---|---|
+| Inference | RTX 5090 | [`docs/inference.md`](docs/inference.md) | `showcases/inference.py` | `configs/inference_5090.yml` |
+| Indexing | RTX 5090 | [`docs/indexing.md`](docs/indexing.md) | `showcases/indexing.py` | `configs/index_5090_b128.yml` |
+| Training | NVIDIA B200 | [`docs/training.md`](docs/training.md) | `showcases/training.py` | `configs/training_b200_*.yml` |
+
+The protocols define the workload, baselines, parity gates, timing and memory
+methodology, environment, and exact reproduction commands. The checked-in images
+under `docs/assets/` are snapshots of those reference runs; the raw result JSON and
+plotting utilities are intentionally not part of the published source set.
+
+`showcases/mixed_serving.py` is an additional mixed query/document workload. It is
+kept alongside the three published runners but does not yet have a canonical
+configuration or published protocol.
+
+Shared showcase scaffolding lives in `helpers/`; it is benchmark code rather than
+part of the installable `packed_encoders` package. Remote orchestration lives in
+`scripts/` so the repository root does not need a second benchmark-specific scripts
+tree.
+
+## Attention dispatch calibration
 
 These benchmarks calibrate `attention_backend="auto"`: the runtime choice between
 the specialized packed Triton attention kernel and FlashAttention. The benchmark
@@ -13,7 +43,7 @@ ignored `benchmarks/results/` directory.
 | `packed_graph_boundary_bench.py` | Full ModernBERT forward validation around the selected graph boundary. |
 | `fit_packed_attention_dispatch.py` | Offline linear-separator search over capture-safe shape features. |
 | `packed_short_attention_bench.py` | Local kernel microbenchmark and parity harness, including AgentIR length profiles. |
-| `../scripts/modal_packed_attention_dispatch_bench.py` | Concurrent A100, L40S, H200, and B200 orchestration. |
+| `scripts/modal_packed_attention_dispatch.py` | Concurrent A100, L40S, H200, and B200 orchestration. |
 
 The obsolete `token_dispatch_bench.py` files are historical padded-dispatch
 experiments and are not callers of the current runtime policy.
@@ -148,12 +178,12 @@ The shared benchmark is
 `benchmarks/fit_packed_attention_dispatch.py`. Run all datacenter cards concurrently:
 
 ```bash
-uvx modal run scripts/modal_packed_attention_dispatch_bench.py
-uvx modal run scripts/modal_packed_attention_dispatch_bench.py --refine
-uvx modal run scripts/modal_packed_attention_dispatch_bench.py \
+uvx modal run benchmarks/scripts/modal_packed_attention_dispatch.py
+uvx modal run benchmarks/scripts/modal_packed_attention_dispatch.py --refine
+uvx modal run benchmarks/scripts/modal_packed_attention_dispatch.py \
   --refine --refine-round 2 --gpus A100,L40S,B200
-uvx modal run scripts/modal_packed_attention_dispatch_bench.py --validate
-uvx modal run scripts/modal_packed_attention_dispatch_bench.py --graph-validate
+uvx modal run benchmarks/scripts/modal_packed_attention_dispatch.py --validate
+uvx modal run benchmarks/scripts/modal_packed_attention_dispatch.py --graph-validate
 ```
 
 Run the local kernel sweep on an installed RTX 5090 environment with:
