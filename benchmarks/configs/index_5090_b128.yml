@@ -1,0 +1,26 @@
+models:
+  sentence_transformers: answerdotai/ModernBERT-base
+  pylate: lightonai/Agent-ModernColBERT
+
+variants:
+  - pylate_eager
+  - pylate_compile_dynamic
+  - pylate_pack
+  - pylate_packed
+  - st_eager
+  - st_compile_dynamic
+  - st_pack
+  - st_packed
+
+index:
+  num_docs: 256
+  batch_size: 128
+  document_length: 2048
+  length_buckets: [256, 512, 1024, 2048]
+  warmup: 1
+  trials: 5
+  trial_repeats: 10
+  seed: 0
+
+output:
+  name: index_5090_b128

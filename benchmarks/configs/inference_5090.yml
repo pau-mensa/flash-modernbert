@@ -1,0 +1,40 @@
+models:
+  sentence_transformers: answerdotai/ModernBERT-base
+  pylate: lightonai/Agent-ModernColBERT
+  query_length: 128
+  document_length: 2048
+
+variants:
+  - pylate_eager
+  - pylate_compile_dynamic
+  - pylate_pack
+  - pylate_packed
+  - st_eager
+  - st_compile_dynamic
+  - st_pack
+  - st_packed
+
+dataset:
+  query_instruction: "Instruct: Given a user's reasoning followed by a web search query, retrieve relevant passages that answer the query.\nQuery: "
+
+query_endpoint:
+  num_texts: 256
+  batch_size: 8
+  cuda_graph: true
+  cuda_graph_pad_to: 32
+  parity_floor: 0.98
+  warmup: 1
+  trials: 5
+  trial_repeats: 10
+
+document_endpoint:
+  num_texts: 256
+  batch_size: 8
+  warmup: 1
+  trials: 5
+  trial_repeats: 10
+
+seed: 0
+
+output:
+  name: inference_5090

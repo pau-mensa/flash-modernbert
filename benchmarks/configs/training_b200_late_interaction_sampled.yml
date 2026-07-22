@@ -1,0 +1,33 @@
+# Full late-interaction training showcase on B200 — with memory sampling.
+# Same as the full config but measures only the 5 heaviest batches for
+# per-step memory instead of all 163, saving ~30 min of stock measurement.
+models:
+  late_interaction: lightonai/GTE-ModernColBERT-v1
+  query_length: 8192
+  document_length: 4096
+
+dataset:
+  num_groups: 5222
+  num_probe_groups: 16
+  num_negatives: 7
+  query_instruction: "Instruct: Given a user's reasoning followed by a web search query, retrieve relevant passages that answer the query while incorporating the user's reasoning\nQuery:"
+
+trainer:
+  batch_size: 32
+  steps: 326
+  warmup_steps: 4
+  compile_warmup: true
+  memory_sample_count: 5
+  probe_every_steps: 50
+  learning_rate: 3.0e-6
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  seed: 42
+  cuda_allocator_conf: "expandable_segments:True"
+
+loss:
+  late_interaction_temperature: 0.01
+  mini_batch_size: 8
+
+output:
+  name: training_b200_late_interaction
